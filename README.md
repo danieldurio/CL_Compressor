@@ -1,6 +1,6 @@
 # 🚀 GPU-Accelerated Deduplication + LZ4 Compressor
 
-## The High-Performance Archival Compressor You've Been Waiting For
+## The High-Performance Archival Compressor
 
 This project is a **high-performance archival compression solution** that uses **GPU acceleration** to perform deduplication and LZ4 compression. Unlike traditional tools, it is designed to handle large volumes of data, such as *extensive directory backups*, offering a significantly higher compression throughput by leveraging the power of commodity Graphics Processing Units (GPUs).
 
