@@ -28,9 +28,36 @@ try:
 except ImportError:
     GPU_LZ4_Decompressor = None
 
+# ============================================================
+# CONFIGURAÇÃO DE BATCH SIZE
+# ============================================================
+# Defina como None para cálculo automático baseado em GPU capabilities,
+# ou um valor inteiro para usar batch size fixo.
+# Exemplo: BATCH_SIZE_OVERRIDE = 24  # Usar batch fixo de 24 frames
+#          BATCH_SIZE_OVERRIDE = None # Calcular automaticamente (padrão)
+#2-4 GB	8-16 frames
+#4-8 GB	16-32 frames
+#8-12 GB	32-64 frames
+#12+ GB	64-128 frames
 
-# Configuration
-GPU_BATCH_SIZE = 24          # Frames per GPU batch (balanced for throughput vs latency)
+BATCH_SIZE_OVERRIDE = None
+# ============================================================
+
+# Determinar GPU_BATCH_SIZE: override fixo ou cálculo automático
+if BATCH_SIZE_OVERRIDE is not None:
+    GPU_BATCH_SIZE = BATCH_SIZE_OVERRIDE
+    print(f"[GPU_LZ4] Batch Size FIXO (definido pelo usuário): {GPU_BATCH_SIZE} frames")
+else:
+    try:
+        from gpu_capabilities import get_recommended_batch_size
+        # Calcular batch size baseado nas capacidades da GPU (frame padrão: 16MB)
+        # Usa 2/3 da recomendação conservadora
+        GPU_BATCH_SIZE = get_recommended_batch_size(frame_size_mb=16)
+        print(f"[GPU_LZ4] Batch Size AUTOMÁTICO: {GPU_BATCH_SIZE} frames (baseado em GPU capabilities)")
+    except Exception as e:
+        print(f"[GPU_LZ4] Erro ao calcular batch size: {e}. Usando padrão: 24")
+        GPU_BATCH_SIZE = 24
+
 MAX_WORKER_THREADS = 2       # Fewer workers to reduce GPU contention (OpenCL serialization)
 GPU_FALLBACK_ENABLED = True  # Enable CPU fallback on GPU errors
 

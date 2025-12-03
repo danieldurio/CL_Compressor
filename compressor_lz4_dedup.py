@@ -22,6 +22,22 @@ from iotools import (
 )
 from deduplicator import GPUFileDeduplicator
 from gpu_lz4_compressor import GPU_LZ4_Compressor
+from gpu_capabilities import get_recommended_batch_size
+
+# ============================================================
+# CONFIGURAÇÃO DE BATCH SIZE
+# ============================================================
+# Defina como None para cálculo automático baseado em GPU capabilities,
+# ou um valor inteiro para usar batch size fixo.
+# Exemplo: BATCH_SIZE_OVERRIDE = 24  # Usar batch fixo de 24 frames
+#          BATCH_SIZE_OVERRIDE = None # Calcular automaticamente (padrão)
+#2-4 GB	8-16 frames
+#4-8 GB	16-32 frames
+#8-12 GB	32-64 frames
+#12+ GB	64-128 frames
+
+BATCH_SIZE_OVERRIDE = None
+# ============================================================
 
 def compress_directory_lz4(
     entries: Iterable[FileEntry],
@@ -218,7 +234,17 @@ def compress_directory_lz4(
 
     # Execução Paralela com Batching
     num_workers = len(compressors) if compressors else 1
-    BATCH_SIZE = 24 # Tamanho do lote para GPU
+    
+    # Determinar batch size: override fixo ou cálculo automático
+    if BATCH_SIZE_OVERRIDE is not None:
+        BATCH_SIZE = BATCH_SIZE_OVERRIDE
+        print(f"[Compressor] Batch Size FIXO (definido pelo usuário): {BATCH_SIZE} frames")
+    else:
+        # Calcular batch size baseado nas capacidades da GPU
+        # Usa 2/3 da recomendação conservadora (ex: 24 -> 16 frames)
+        frame_size_for_calc = frame_size // (1024 * 1024)  # Converter para MB
+        BATCH_SIZE = get_recommended_batch_size(frame_size_mb=frame_size_for_calc)
+        print(f"[Compressor] Batch Size AUTOMÁTICO: {BATCH_SIZE} frames (baseado em GPU capabilities)")
     
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {} # batch_id -> Future

@@ -517,11 +517,26 @@ class GPU_LZ4_Compressor:
     Wrapper para o kernel LZ4 OpenCL.
     Implementa uma compressão LZ4 simplificada (PoC) na GPU.
     """
-    def __init__(self, device_index: int = 0, max_input_size: int = 16 * 1024 * 1024, batch_size: int = 24):
+    def __init__(self, device_index: int = 0, max_input_size: int = 16 * 1024 * 1024, batch_size: Optional[int] = None):
         self.enabled = False
         self.device_index = device_index
         self.max_input_size = 0 # Será definido por allocate_buffers
-        self.batch_size = batch_size
+        
+        # Calcular batch size automaticamente se não fornecido
+        if batch_size is None:
+            try:
+                from gpu_capabilities import get_recommended_batch_size
+                frame_size_mb = max_input_size // (1024 * 1024)
+                self.batch_size = get_recommended_batch_size(frame_size_mb=frame_size_mb)
+                print(f"[GPU_LZ4_Compressor] Batch Size calculado automaticamente: {self.batch_size} frames")
+            except Exception as e:
+                print(f"[GPU_LZ4_Compressor] Erro ao calcular batch size: {e}. Usando padrão: 24")
+                self.batch_size = 24
+        else:
+            # Usuário forneceu explicitamente - respeitar o valor
+            self.batch_size = batch_size
+            print(f"[GPU_LZ4_Compressor] Usando Batch Size fornecido pelo usuário: {self.batch_size} frames")
+        
         self.ctx: Optional[cl.Context] = None
         self.queue: Optional[cl.CommandQueue] = None
         self.program: Optional[cl.Program] = None
