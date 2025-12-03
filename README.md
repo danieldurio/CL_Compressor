@@ -6,6 +6,7 @@ This project implements a full custom archival format with its own compressor, d
 Designed for large directory backups, fast distribution, and high compression throughput using commodity GPUs.
 
 🚀 Key Features
+
     1. GPU-Accelerated Deduplication
 
 File-level deduplication with a multi-stage filter pipeline:
