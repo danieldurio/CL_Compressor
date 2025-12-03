@@ -85,7 +85,7 @@ Archive integrity info
 
 The index is zlib-compressed and appended with a footer:
 
-[offset][size][GPU_IDX1_MAGIC]
+[offset][size][IDX1_MAGIC]
 
     6. GPU/CPU Hybrid Decompressor
 
@@ -106,13 +106,21 @@ First restores originals
 Then creates duplicates via hardlink or file copy
 
 📦 Project Structure
+
 /compressor_lz4_dedup.py     → Main compressor
+
 /decompressor_lz4.py         → Main decompressor (with GPU + CPU fallback)
+
 /deduplicator.py             → Multi-stage GPU deduplicator
+
 /gpu_lz4_compressor.py       → LZ4 GPU kernel + batch engine
+
 /gpu_lz4_decompressor.py     → LZ4 GPU decompressor
+
 /gpu_capabilities.py         → GPU hardware detection
+
 /decompressor_dedup.py       → Duplicate file reconstruction
+
 /iotools.py                  → File streaming utilities
 
 ⚙️ How It Works (Architecture Overview)
