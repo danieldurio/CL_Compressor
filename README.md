@@ -1,7 +1,7 @@
 GPU-Accelerated Deduplication + LZ4 Compressor
 
 A high-performance archival compressor using GPU-accelerated deduplication, GPU LZ4 compression, frame-based chunking, and multi-volume output.
-This project implements a full custom archival format (.gpu) with its own compressor, decompressor, metadata index, and hybrid CPU/GPU fallback pipeline.
+This project implements a full custom archival format with its own compressor, decompressor, metadata index, and hybrid CPU/GPU fallback pipeline.
 
 Designed for large directory backups, fast distribution, and high compression throughput using commodity GPUs.
 
@@ -56,7 +56,7 @@ Highly parallel batch compressor with worker pools
 
 4. Multi-Volume Output
 
-Archive is split into multiple volumes (.gpu.001, .gpu.002, ...)
+Archive is split into multiple volumes (.001, .002, ...)
 
 Default volume size: 98 MB
 
@@ -188,7 +188,7 @@ Compress a directory
 python compressor_lz4_dedup.py <source_folder> -o <output_name>
 
 Extract
-python decompressor_lz4.py <archive.gpu.001> -o <destination_folder>
+python decompressor_lz4.py <archive.001> -o <destination_folder>
 
 Optional settings
 
@@ -200,12 +200,7 @@ Optional settings
 
 --force-cpu
 
-🗂️ The .gpu Archive Format
-Files:
-archive.gpu.001
-archive.gpu.002
-...
-archive.gpu.NNN
+archive.NNN
 
 Footer (last volume):
 uint64  index_offset
