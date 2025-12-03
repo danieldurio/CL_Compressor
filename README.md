@@ -117,3 +117,88 @@ Contributions, pull requests, issue reports, and suggestions are highly welcome!
 
 ---
 
+## Real Console Output log Compress / Extract (Sample)
+
+'''
+E:\TheStorage\runtime\compressor>python compressor_lz4_dedup.py E:\tmp -o E:\teste.gpu
+======================================================================
+COMPRESSOR LZ4 GPU + DEDUP
+======================================================================
+Fonte: E:\tmp
+Saída: E:\teste.gpu
+======================================================================
+Arquivos: 16496 (1292817530 bytes)
+
+[Fase 1] Deduplicação GPU...
+[Deduplicator] GPU Hashing ativado: NVIDIA GeForce GTX 1050 Ti
+[Deduplicator] Iniciando busca por duplicatas em 16496 arquivos...
+[Dedup Stage 1] Size Filter: 5176 grupos únicos. 13921 arquivos candidatos a duplicata.
+[Dedup Stage 2] First 2 Bytes: 2283 removidos. 11638 restantes.
+[Dedup Stage 3] Last 2 Bytes:  933 removidos. 10705 restantes.
+[Dedup Stage 4] Center 3 Bytes: 4841 removidos. 5864 restantes para Hash Completo.
+[Dedup Final] Encontradas 1532 duplicatas reais.
+[Dedup Final] Economia potencial: 50.35 MB
+[Dedup Final] Encontradas 1532 duplicatas reais.
+[Dedup Final] Economia potencial: 50.35 MB
+Tamanho efetivo: 1240023174 bytes
+Economia Dedup: 50.35 MB (4.1%)
+
+[Fase 2] Compressão LZ4 GPU...
+[Compressor] Parâmetros: frame_size=16MB, max_volume=98MB
+[Compressor] Detectadas 1 GPUs. Inicializando compressores...
+[GPU_LZ4] Compressor LZ4 OpenCL ativado em: NVIDIA GeForce GTX 1050 Ti (Index: 0)
+[GPU_LZ4] Buffers persistentes alocados: Input=16.0MB, Output=16.1MB, Hash=32768.0KB
+[Compressor] Iniciando compressão com 1 workers GPU...
+[LZ4] Frame 0 GPU1: 16777216 -> 12613956 (75.2%) | Economia: 4163260
+[VolumeWriter] Abrindo novo volume: E:\teste.gpu.001
+[VolumeWriter] Abrindo novo volume: E:\teste.gpu.002 | 519.9 MB/s
+[Compressor] | LZ_EXT3_GPU=5 (62.50%) | RAW=3 (37.50%) | Redução = 62.5%
+HIT: GPU1 = 8 | Tamanho real = 128MB | Tamanho atual = 48MB
+Last Frame - GPU1 = 7 | Progresso atual = 10.8%
+[VolumeWriter] Abrindo novo volume: E:\teste.gpu.003 | 1844.7 MB/s
+[Compressor] | LZ_EXT3_GPU=9 (64.29%) | RAW=5 (35.71%) | Redução = 64.3%
+HIT: GPU1 = 14 | Tamanho real = 224MB | Tamanho atual = 80MB
+Last Frame - GPU1 = 13 | Progresso atual = 18.9%
+[VolumeWriter] Abrindo novo volume: E:\teste.gpu.011 | 3063.4 MB/s
+[Compressor] | LZ_EXT3_GPU=22 (34.38%) | RAW=42 (65.62%) | Redução = 34.4%
+HIT: GPU1 = 64 | Tamanho real = 1024MB | Tamanho atual = 672MB
+Last Frame - GPU1 = 63 | Progresso atual = 86.6%
+[Compressor] | LZ_EXT3_GPU=32 (43.24%) | RAW=42 (56.76%) | Redução = 43.2%
+HIT: GPU1 = 74 | Tamanho real = 1183MB | Tamanho atual = 672MB
+Last Frame - GPU1 = 73 | Progresso atual = 100.0%
+[Index] Incorporando índice comprimido (148414 bytes) em teste.gpu.011...
+[Index] Footer gravado. Offset=89272883, Size=148414
+
+======================================================================
+✅ Processo Completo Finalizado!
+======================================================================
+'''
+
+'''
+E:\TheStorage\runtime\compressor>python decompressor_lz4.py E:\teste.gpu.001 -o e:\teste
+Volumes encontrados: 11. Último: teste.gpu.011
+Índice encontrado: Offset=89272883, Size=148414
+Índice carregado e descomprimido com sucesso.
+Restaurando 16496 arquivos para E:\teste...
+[GPU_LZ4] Decompressor OpenCL initialized on NVIDIA GeForce GTX 1050 Ti (Index: 0)
+
+[GPU_LZ4] GPU Decompressors initialized: 1
+[GPU_LZ4] Processing 74 frames in 4 batches (size=24)
+[GPU_LZ4] Worker threads: 2
+
+Progresso: 74/74 frames | 12.0 MB/s | GPU: 32 | CPU: 42 | Fila: 0
+Criando 1532 arquivos duplicados (dedup reverso)...
+[Duplicatas] 1532/1532 arquivos duplicados recriados.
+
+============================================================
+Descompressão concluída!
+============================================================
+Tempo total:      100.0s
+Frames totais:    74
+  - GPU:          32 (43.2%)
+  - CPU:          42 (56.8%)
+Dados escritos:   1182.6 MB
+Velocidade média: 11.8 MB/s
+============================================================
+'''
+
