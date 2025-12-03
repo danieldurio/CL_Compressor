@@ -119,7 +119,7 @@ Contributions, pull requests, issue reports, and suggestions are highly welcome!
 
 ## Real Console Output log Compress / Extract (Sample)
 
-'''
+
 E:\TheStorage\runtime\compressor>python compressor_lz4_dedup.py E:\tmp -o E:\teste.gpu
 ======================================================================
 COMPRESSOR LZ4 GPU + DEDUP
@@ -172,9 +172,9 @@ Last Frame - GPU1 = 73 | Progresso atual = 100.0%
 ======================================================================
 ✅ Processo Completo Finalizado!
 ======================================================================
-'''
 
-'''
+
+
 E:\TheStorage\runtime\compressor>python decompressor_lz4.py E:\teste.gpu.001 -o e:\teste
 Volumes encontrados: 11. Último: teste.gpu.011
 Índice encontrado: Offset=89272883, Size=148414
