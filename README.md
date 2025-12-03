@@ -1,254 +1,120 @@
-GPU-Accelerated Deduplication + LZ4 Compressor
+# 🚀 GPU-Accelerated Deduplication + LZ4 Compressor
 
-A high-performance archival compressor using GPU-accelerated deduplication, GPU LZ4 compression, frame-based chunking, and multi-volume output.
-This project implements a full custom archival format with its own compressor, decompressor, metadata index, and hybrid CPU/GPU fallback pipeline.
+## The High-Performance Archival Compressor You've Been Waiting For
 
-Designed for large directory backups, fast distribution, and high compression throughput using commodity GPUs.
+This project is a **high-performance archival compression solution** that uses **GPU acceleration** to perform deduplication and LZ4 compression. Unlike traditional tools, it is designed to handle large volumes of data, such as *extensive directory backups*, offering a significantly higher compression throughput by leveraging the power of commodity Graphics Processing Units (GPUs).
 
-🚀 Key Features
+The project implements a complete **custom archival format**, including its own compressor, decompressor, metadata index, and a hybrid (CPU/GPU) pipeline to ensure maximum performance and compatibility.
 
-    1. GPU-Accelerated Deduplication
+## ✨ Key Features
 
-File-level deduplication with a multi-stage filter pipeline:
+What makes this compressor unique and extremely efficient:
 
-Size grouping
+| Feature | Description | Primary Benefit |
+| :--- | :--- | :--- |
+| **GPU-Accelerated Deduplication** | Multi-stage filter pipeline (size, first/last/center bytes) culminating in 64-bit hash validation by GPU (FNV-1a). | **Drastic reduction in I/O and final size** before compression, detecting duplicates with zero false positives. |
+| **GPU LZ4 Compressor (Extended Window)** | Custom LZ4 implementation running entirely on the GPU, with a **16 MB** sliding window (larger than standard) and 3-byte offset encoding. | **Compression speed of 2-3+ GB/s** (depending on the GPU), optimized for high throughput. |
+| **Frame-Based Streaming Compressor** | Concatenates files into a continuous byte stream, split into 16 MB frames, processed **independently and in parallel** (supports multi-GPU). | **Highly parallel** and efficient processing for large files. |
+| **Multi-Volume Output** | The final archive is split into smaller volumes (default: 98 MB), such as `.001`, `.002`, etc. | Facilitates distribution, compatibility with legacy file systems (e.g., FAT32), and allows **resumable** processing. |
+| **Hybrid Decompressor (GPU/CPU)** | Attempts GPU decompression first and, in case of incompatible hardware or error, performs an **automatic fallback to CPU**, ensuring integrity and compatibility. | **Guarantees correctness** on older hardware or in case of GPU kernel corruption. |
 
-First bytes check
+## ⚙️ How It Works (Architecture Overview)
 
-Last bytes check
+The compression process is divided into stages optimized for GPU parallelism:
 
-Middle bytes check
+1.  **Directory Scan:** Collects metadata, preserves relative paths, and detects empty files.
+2.  **Deduplication Pipeline:** Fast filters (size, bytes) + GPU hash for remaining candidates. Duplicate files are removed before compression.
+3.  **Frame Generation:** Creation of sequential 16 MB frames from non-duplicate file data.
+4.  **GPU LZ4 Compression:** Each frame is compressed on the GPU using the extended-window LZ4.
+5.  **Multi-Volume Writing:** Frames are inserted into volumes, respecting the maximum size.
+6.  **Indexing:** The final volume receives a compressed index (zlib) containing metadata, deduplication map, and frame descriptors.
+7.  **Decompression:** Reverse process with GPU or CPU, followed by the reconstruction of deduplicated files (restores originals and creates duplicates via hardlink/copy).
 
-Full 64-bit GPU hash validation
+## 📊 Performance and Results
 
-GPU hashing using FNV-1a parallel chunked hashing
+The use of the GPU provides notable performance gains:
 
-Detects true duplicates with zero false positives
+*   **Deduplication:** GPU hashing drastically reduces CPU overhead for large folders.
+*   **Compression Speed:** GPU LZ4 can reach **2–3+ GB/s**, depending on the card.
+*   **Total Reduction:** The combination of Deduplication + LZ4 typically results in a **total reduction of 60–85%** in file size.
 
-Reduces I/O and final archive size dramatically before compression
+> **Example Output (Real Production Log):**
+>
+> ```
+> Dedup Final: Found 129 duplicates (586.13 MB saved)
+> Remaining size: 1.01 GB
+> 
+> GPU LZ4 Compression:
+> LZ_EXT3_GPU=46 (75.41%) | RAW=15 (24.59%)
+> Final: 971 MB → 240 MB (75.3% reduction)
+> ```
 
-    2. GPU LZ4 Compressor (Extended 16MB Window)
+## 🛠️ Requirements
 
-A custom LZ4 implementation running entirely on the GPU:
+To run the compressor, you will need:
 
-16 MB sliding window (larger than standard LZ4)
+*   **Python 3.9+**
+*   **PyOpenCL**
+*   **Numpy**
+*   **LZ4**
+*   **Zlib** (usually built-in with Python)
+*   **Any CUDA/OpenCL compatible GPU**
+    *   *Recommended:* NVIDIA GTX 1050 Ti or better.
 
-3-byte offset encoding (extended range)
+## 🚀 Usage
 
-Hash table with multiple candidates per entry
+### 1. Installation
 
-Lazy matching and skip heuristics
+```bash
+# Clone the repository
+git clone [YOUR_REPOSITORY_URL]
+cd [REPOSITORY_NAME]
 
-Per-frame GPU parallelism
+# Install dependencies
+pip install pyopencl numpy lz4
+```
 
-Fallback to raw blocks when compression is not beneficial
+### 2. Compress a Directory
 
-    3. Frame-Based Streaming Compressor
+Use the main script `compressor_lz4_dedup.py`:
 
-Files are concatenated into a continuous byte stream
+```bash
+python compressor_lz4_dedup.py <source_folder> -o <output_file_name>
+```
 
-Stream is split into 16 MB frames
+*Example:*
+```bash
+python compressor_lz4_dedup.py /home/user/my_files -o backup_2025
+# This will create files like backup_2025.001, backup_2025.002, etc.
+```
 
-Each frame is compressed independently
+### 3. Decompress an Archive
 
-Supports multi-GPU processing
+Use the `decompressor_lz4.py` script and point to the first volume (`.001`):
 
-Highly parallel batch compressor with worker pools
+```bash
+python decompressor_lz4.py <output_file.001> -o <destination_folder>
+```
 
-    4. Multi-Volume Output
+*Example:*
+```bash
+python decompressor_lz4.py backup_2025.001 -o /home/user/restoration
+```
 
-Archive is split into multiple volumes (.001, .002, ...)
+## 🗺️ Roadmap
 
-Default volume size: 98 MB
+The project is constantly evolving. Future plans include:
 
-Enables:
+*   Multi-GPU scaling.
+*   Streaming Compressor (`stdin`/`stdout` mode).
+*   Optional Zstd-GPU backend.
+*   Adaptive window sizes.
+*   Repair tool for missing volumes.
 
-easier distribution
+## 🤝 Contributing
 
-FAT32 compatibility
+Contributions, pull requests, issue reports, and suggestions are highly welcome! This is an experimental, research-oriented project, and your help is essential for continuous improvement.
 
-resumable processing
+---
 
-    5. Embedded Compressed Index
-
-The final volume stores:
-
-File list with metadata
-
-Deduplication map
-
-Frame table (offsets, sizes, compression mode)
-
-Compressor parameters
-
-Archive integrity info
-
-The index is zlib-compressed and appended with a footer:
-
-[offset][size][IDX1_MAGIC]
-
-    6. GPU/CPU Hybrid Decompressor
-
-Tries GPU decompression first
-
-Falls back to CPU on:
-
-unsupported hardware
-
-errors
-
-corrupted GPU kernels
-
-Reconstructs deduplicated files
-
-First restores originals
-
-Then creates duplicates via hardlink or file copy
-
-📦 Project Structure
-
-/compressor_lz4_dedup.py     → Main compressor
-
-/decompressor_lz4.py         → Main decompressor (with GPU + CPU fallback)
-
-/deduplicator.py             → Multi-stage GPU deduplicator
-
-/gpu_lz4_compressor.py       → LZ4 GPU kernel + batch engine
-
-/gpu_lz4_decompressor.py     → LZ4 GPU decompressor
-
-/gpu_capabilities.py         → GPU hardware detection
-
-/decompressor_dedup.py       → Duplicate file reconstruction
-
-/iotools.py                  → File streaming utilities
-
-⚙️ How It Works (Architecture Overview)
-    1. Directory Scan
-
-Collect file metadata, preserve relative paths, and detect empty files.
-
-    2. Deduplication Pipeline
-
-Fast filters (size, first/last/center bytes)
-
-GPU hash for remaining candidates
-
-Build deduplication table
-
-Remove duplicates before compression
-
-    3. Frame Generation
-
-Sequential 16 MB frames created from non-duplicate file data.
-
-    4. GPU LZ4 Compression
-
-Each frame is compressed on GPU using extended-window LZ4.
-
-    5. Multi-Volume Writing
-
-Frames are inserted into volumes respecting the maximum size.
-
-    6. Index Embedding
-
-Final volume receives compressed index + footer.
-
-    7. Decompression
-
-Reverse process with GPU or CPU, then deduplication reconstruction.
-
-📈 Example Output (Real Production Log)
-Dedup Final: Found 129 duplicates (586.13 MB saved)
-Remaining size: 1.01 GB
-
-GPU LZ4 Compression:
-LZ_EXT3_GPU=46 (75.41%) | RAW=15 (24.59%)
-Final: 971 MB → 240 MB (75.3% reduction)
-
-🧪 Performance Notes
-
-GPU hashing extremely reduces CPU overhead for large folders
-
-GPU LZ4 compression can reach 2–3+ GB/s depending on card
-
-Dedup + LZ4 typically yields 60–85% total reduction
-
-Fallback mechanisms guarantee correctness on older GPUs
-
-🔧 Requirements
-
-Python 3.9+
-
-PyOpenCL
-
-Numpy
-
-LZ4
-
-Zlib (built-in)
-
-Any CUDA/OpenCL compatible GPU
-
-NVIDIA GTX 1050 Ti or better recommended
-
-📘 Usage
-Compress a directory
-
-                python compressor_lz4_dedup.py <source_folder> -o <output_name>
-
-Extract
-
-                python decompressor_lz4.py <archive.001> -o <destination_folder>
-
-archive.NNN
-
-Footer (last volume):
-uint64  index_offset
-uint32  index_size
-char[8] GPU_IDX1_MAGIC
-
-Index Content:
-
-Version
-
-File entries (original / duplicates)
-
-Frame descriptors
-
-Compression modes per frame
-
-GPU parameters
-
-Checksums
-
-📍 Project Goals
-
-Experiment with GPU-accelerated data compression
-
-Create a flexible archival format for large backups
-
-Explore large-window LZ4 variants on OpenCL
-
-Achieve high throughput on consumer GPUs
-
-🛣️ Roadmap
-
- Multi-GPU scaling
-
- Streaming compressor (stdin/stdout mode)
-
- Optional Zstd-GPU backend
-
- Adaptive window sizes
-
- Error correction and checksums
-
- Archive info viewer (gpuinfo)
-
- Repair tool for missing volumes
-
-🤝 Contributing
-
-Pull requests, issues, and suggestions are welcome!
-This project is experimental, research-oriented, and constantly improving.
+*This README was prepared with the assistance of **Manus AI**.*
