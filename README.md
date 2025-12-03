@@ -117,4 +117,3 @@ Contributions, pull requests, issue reports, and suggestions are highly welcome!
 
 ---
 
-*This README was prepared with the assistance of **Manus AI**.*
