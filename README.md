@@ -194,9 +194,11 @@ NVIDIA GTX 1050 Ti or better recommended
 
 📘 Usage
 Compress a directory
+
                 python compressor_lz4_dedup.py <source_folder> -o <output_name>
 
 Extract
+
                 python decompressor_lz4.py <archive.001> -o <destination_folder>
 
 archive.NNN
