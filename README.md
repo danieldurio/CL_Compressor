@@ -6,7 +6,7 @@ This project implements a full custom archival format with its own compressor, d
 Designed for large directory backups, fast distribution, and high compression throughput using commodity GPUs.
 
 🚀 Key Features
-1. GPU-Accelerated Deduplication
+    1. GPU-Accelerated Deduplication
 
 File-level deduplication with a multi-stage filter pipeline:
 
@@ -26,7 +26,7 @@ Detects true duplicates with zero false positives
 
 Reduces I/O and final archive size dramatically before compression
 
-2. GPU LZ4 Compressor (Extended 16MB Window)
+    2. GPU LZ4 Compressor (Extended 16MB Window)
 
 A custom LZ4 implementation running entirely on the GPU:
 
@@ -42,7 +42,7 @@ Per-frame GPU parallelism
 
 Fallback to raw blocks when compression is not beneficial
 
-3. Frame-Based Streaming Compressor
+    3. Frame-Based Streaming Compressor
 
 Files are concatenated into a continuous byte stream
 
@@ -54,7 +54,7 @@ Supports multi-GPU processing
 
 Highly parallel batch compressor with worker pools
 
-4. Multi-Volume Output
+    4. Multi-Volume Output
 
 Archive is split into multiple volumes (.001, .002, ...)
 
@@ -68,7 +68,7 @@ FAT32 compatibility
 
 resumable processing
 
-5. Embedded Compressed Index
+    5. Embedded Compressed Index
 
 The final volume stores:
 
@@ -86,7 +86,7 @@ The index is zlib-compressed and appended with a footer:
 
 [offset][size][GPU_IDX1_MAGIC]
 
-6. GPU/CPU Hybrid Decompressor
+    6. GPU/CPU Hybrid Decompressor
 
 Tries GPU decompression first
 
@@ -115,11 +115,11 @@ Then creates duplicates via hardlink or file copy
 /iotools.py                  → File streaming utilities
 
 ⚙️ How It Works (Architecture Overview)
-1. Directory Scan
+    1. Directory Scan
 
 Collect file metadata, preserve relative paths, and detect empty files.
 
-2. Deduplication Pipeline
+    2. Deduplication Pipeline
 
 Fast filters (size, first/last/center bytes)
 
@@ -129,23 +129,23 @@ Build deduplication table
 
 Remove duplicates before compression
 
-3. Frame Generation
+    3. Frame Generation
 
 Sequential 16 MB frames created from non-duplicate file data.
 
-4. GPU LZ4 Compression
+    4. GPU LZ4 Compression
 
 Each frame is compressed on GPU using extended-window LZ4.
 
-5. Multi-Volume Writing
+    5. Multi-Volume Writing
 
 Frames are inserted into volumes respecting the maximum size.
 
-6. Index Embedding
+    6. Index Embedding
 
 Final volume receives compressed index + footer.
 
-7. Decompression
+    7. Decompression
 
 Reverse process with GPU or CPU, then deduplication reconstruction.
 
