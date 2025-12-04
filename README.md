@@ -42,32 +42,7 @@ The system generates a comprehensive index of all files, frames, and compression
 
 ## ⚙️ How It Works (Architecture Overview)
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                    compressor_lz4_dedup.py (Main)                   │
-├─────────────────────────────────────────────────────────────────────┤
-│  1. Scan Directory (iotools.scan_directory)                         │
-│  2. Deduplicação GPU (deduplicator.GPUFileDeduplicator)             │
-│  3. Pipeline I/O (Triple Buffer)                                    │
-│     ├─ Reader Thread → [Frame Queue] →                              │
-│     ├─ Compress Workers → [Write Queue] →                           │
-│     └─ Writer Thread                                                │
-│  4. Embed Index (iotools.embed_index_file)                          │
-└─────────────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┴─────────────────────┐
-        ▼                                           ▼
-   ┌───────────────────────┐               ┌───────────────────────┐
-   │  GPU_LZ4_Compressor   │               │  CPU_LZ4_Compressor   │
-   │  (gpu_lz4_compressor) │               │  (compressor_fallback)│
-   ├───────────────────────┤               ├───────────────────────┤
-   │ • OpenCL Kernel       │               │ • Pure Python         │
-   │ • HASH_LOG=20 (1M)    │               │ • ThreadPoolExecutor  │
-   │ • 7 Candidates/Hash   │               │ • cpu_count() workers │
-   │ • 3-byte offsets      │               │ • 3-byte offsets      │
-   │ • 16MB window         │               │ • 16MB window         │
-   │ • Batch processing    │               │ • Batch processing    │
-   │ • Multi-GPU support   │               │ • 100% CPU usage      │
-   └───────────────────────┘               └───────────────────────┘
+
 
 The compression process follows a streamlined, high-throughput pipeline:
 
