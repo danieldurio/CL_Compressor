@@ -28,6 +28,13 @@ try:
 except ImportError:
     GPU_LZ4_Decompressor = None
 
+# Import GPU selector for interactive GPU selection
+try:
+    from gpu_selector import prompt_gpu_selection, get_excluded_indices
+    GPU_SELECTOR_AVAILABLE = True
+except ImportError:
+    GPU_SELECTOR_AVAILABLE = False
+
 # ============================================================
 # CONFIGURAÇÃO DE BATCH SIZE
 # ============================================================
@@ -591,20 +598,36 @@ def main() -> int:
             platforms = cl.get_platforms()
             if platforms:
                 all_gpus = []
+                gpu_indices_map = []  # Maps filtered index to global index
+                global_idx = 0
+                
                 for p in platforms:
                     try:
-                        all_gpus.extend(p.get_devices(device_type=cl.device_type.GPU))
+                        platform_gpus = p.get_devices(device_type=cl.device_type.GPU)
+                        for gpu in platform_gpus:
+                            all_gpus.append(gpu)
+                            gpu_indices_map.append(global_idx)
+                            global_idx += 1
                     except:
                         pass
                 
-                # Initialize one decompressor per GPU
-                for gpu_idx in range(len(all_gpus)):
-                    try:
-                        decompressor = GPU_LZ4_Decompressor(device_index=gpu_idx)
-                        if decompressor.enabled:
-                            gpu_decompressors.append(decompressor)
-                    except Exception as e:
-                        print(f"[GPU_LZ4] Failed to initialize GPU {gpu_idx}: {e}")
+                if all_gpus:
+                    # Prompt for GPU selection (only if selector available and multiple GPUs)
+                    excluded_indices = []
+                    if GPU_SELECTOR_AVAILABLE:
+                        excluded_indices = prompt_gpu_selection()
+                    
+                    # Initialize one decompressor per enabled GPU
+                    for idx, gpu_global_idx in enumerate(gpu_indices_map):
+                        if gpu_global_idx in excluded_indices:
+                            continue  # Skip excluded GPUs
+                        
+                        try:
+                            decompressor = GPU_LZ4_Decompressor(device_index=gpu_global_idx)
+                            if decompressor.enabled:
+                                gpu_decompressors.append(decompressor)
+                        except Exception as e:
+                            print(f"[GPU_LZ4] Failed to initialize GPU {gpu_global_idx}: {e}")
             
             if not gpu_decompressors:
                 print("[GPU_LZ4] No GPUs available, using CPU only")

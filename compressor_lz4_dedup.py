@@ -30,6 +30,7 @@ try:
     import pyopencl as cl
     from gpu_lz4_compressor import GPU_LZ4_Compressor
     from gpu_capabilities import get_recommended_batch_size
+    from gpu_selector import prompt_gpu_selection, get_filtered_devices, get_excluded_indices
     OPENCL_AVAILABLE = True
 except ImportError as e:
     print(f"[Compressor] OpenCL não disponível: {e}")
@@ -109,28 +110,39 @@ def compress_directory_lz4(
         compressors.append(cpu_comp)
         print(f"[Compressor] Usando 1 compressor CPU com {cpu_comp.cpu_count} workers paralelos")
     else:
-        # Modo GPU - detectar e inicializar GPUs
-        platforms = cl.get_platforms()
-        devices = []
-        for p in platforms:
-            try:
-                devices.extend(p.get_devices(device_type=cl.device_type.GPU))
-            except:
-                pass
+        # Modo GPU - prompt para seleção de GPUs
+        excluded_indices = prompt_gpu_selection()
+        
+        # Obter dispositivos filtrados
+        devices = get_filtered_devices(excluded_indices)
         
         if not devices:
-            print("[Compressor] Nenhuma GPU detectada! Ativando fallback CPU...")
+            print("[Compressor] Nenhuma GPU disponível! Ativando fallback CPU...")
             USE_CPU_FALLBACK = True
             cpu_comp = CPU_LZ4_Compressor()
             compressors.append(cpu_comp)
         else:
-            print(f"[Compressor] Detectadas {len(devices)} GPUs. Inicializando compressores...")
-            for i in range(len(devices)):
-                comp = GPU_LZ4_Compressor(device_index=i, max_input_size=frame_size, batch_size=BATCH_SIZE)
+            # Obter índices das GPUs habilitadas
+            enabled_indices = []
+            all_platforms = cl.get_platforms()
+            global_idx = 0
+            for p in all_platforms:
+                try:
+                    platform_devices = p.get_devices(device_type=cl.device_type.GPU)
+                    for _ in platform_devices:
+                        if global_idx not in excluded_indices:
+                            enabled_indices.append(global_idx)
+                        global_idx += 1
+                except:
+                    pass
+            
+            print(f"[Compressor] Inicializando {len(enabled_indices)} GPUs...")
+            for gpu_index in enabled_indices:
+                comp = GPU_LZ4_Compressor(device_index=gpu_index, max_input_size=frame_size, batch_size=BATCH_SIZE)
                 if comp.enabled:
                     compressors.append(comp)
                 else:
-                    print(f"[Compressor] Falha ao inicializar compressor na GPU {i}")
+                    print(f"[Compressor] Falha ao inicializar compressor na GPU {gpu_index}")
             
             # Se nenhuma GPU funcionou, fallback para CPU
             if not compressors:
