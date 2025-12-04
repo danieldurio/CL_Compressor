@@ -4,7 +4,7 @@
 
 This project is a **high-performance archival compression solution** that uses **GPU acceleration** to perform deduplication and LZ4 compression. Unlike traditional tools, it is designed to handle large volumes of data, such as *extensive directory backups*, offering a significantly higher compression throughput by leveraging the power of commodity Graphics Processing Units (GPUs).
 
-This project implements a high-performance data compression and archival system leveraging GPU acceleration via OpenCL for both deduplication hashing and the core LZ4 compression algorithm. It features a custom, highly optimized compression kernel and a multi-stage deduplication pipeline to achieve superior speed and efficiency.
+High-performance data compression and archival system leveraging GPU acceleration via OpenCL. It features a custom, highly optimized compression kernel and a multi-stage deduplication pipeline to achieve superior speed and efficiency.
 
 ## ✨ Key Features
 
