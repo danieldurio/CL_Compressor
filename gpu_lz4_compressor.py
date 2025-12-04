@@ -12,8 +12,8 @@ import contextlib
 # HASH_LOG = 18 -> 262144 entradas (1MB de memória global)
 # Mudamos para Global Memory para permitir uma tabela maior e melhorar o ratio
 # O impacto na performance é mitigado pelo cache L2 da GPU
-HASH_LOG = 20
-HASH_CANDIDATES = 8  # Otimizado: Top-K adaptativo (era 32)
+HASH_LOG = 20 # AJUSTAR O KERNEL IGUAL
+HASH_CANDIDATES = 7  # AJUSTAR O KERNEL IGUAL
 HASH_ENTRIES = (1 << HASH_LOG)
 HASH_TABLE_SIZE = HASH_ENTRIES * HASH_CANDIDATES
 
@@ -31,7 +31,7 @@ LZ4_KERNEL_SOURCE = """
 // - Cada entrada guarda HASH_CANDIDATES posições recentes
 #define HASH_LOG        20u
 #define HASH_ENTRIES    (1u << HASH_LOG)     // 1048576 (1M)
-#define HASH_CANDIDATES 8u                    // Top-K adaptativo: 8 candidatos mais recentes
+#define HASH_CANDIDATES 7u                    // Top-K adaptativo: 8 candidatos mais recentes
 #define HASH_TABLE_SIZE (HASH_ENTRIES * HASH_CANDIDATES)
 
 // Hash LZ4 padrão
@@ -616,6 +616,43 @@ class GPU_LZ4_Compressor:
                 
                 mf = cl.mem_flags
                 
+                # Calcular tamanhos totais ANTES de alocar
+                total_input_size = self.max_input_size * self.batch_size
+                total_output_size = self.max_compressed_size * self.batch_size
+                hash_table_bytes = HASH_TABLE_SIZE * 4 * self.batch_size
+                total_vram_needed = total_input_size + total_output_size + hash_table_bytes
+                
+                # Verificar VRAM disponível
+                try:
+                    # Pegar device da GPU
+                    devices = []
+                    platforms = cl.get_platforms()
+                    for p in platforms:
+                        try:
+                            devices.extend(p.get_devices(device_type=cl.device_type.GPU))
+                        except:
+                            pass
+                    
+                    if self.device_index < len(devices):
+                        device = devices[self.device_index]
+                        vram_total = device.global_mem_size
+                        vram_total_mb = vram_total / 1024 / 1024
+                        vram_needed_mb = total_vram_needed / 1024 / 1024
+                        vram_usage_pct = (total_vram_needed / vram_total) * 100
+                        
+                        print(f"[GPU_LZ4] VRAM Total: {vram_total_mb:.0f}MB | Necessário: {vram_needed_mb:.0f}MB ({vram_usage_pct:.1f}%)")
+                        
+                        if total_vram_needed > vram_total * 0.8:  # > 80% de VRAM
+                            print(f"[GPU_LZ4] AVISO: Uso de VRAM muito alto ({vram_usage_pct:.1f}%)!")
+                            print(f"[GPU_LZ4] Considere reduzir batch_size ou HASH_CANDIDATES")
+                        
+                        if total_vram_needed > vram_total:
+                            print(f"[GPU_LZ4] ERRO: Batch size muito grande! Necessário {vram_needed_mb:.0f}MB mas apenas {vram_total_mb:.0f}MB disponível")
+                            self.enabled = False
+                            return
+                except Exception as e:
+                    print(f"[GPU_LZ4] Aviso: Não foi possível verificar VRAM: {e}")
+                
                 # Buffers de Dados (Tamanho Total = Frame Size * Batch Size)
                 total_input_size = self.max_input_size * self.batch_size
                 total_output_size = self.max_compressed_size * self.batch_size
@@ -641,7 +678,14 @@ class GPU_LZ4_Compressor:
                     hash_table_bytes
 )
                 
-                print(f"[GPU_LZ4] Buffers persistentes alocados: Input={self.max_input_size/1024/1024:.1f}MB, Output={self.max_compressed_size/1024/1024:.1f}MB, Hash={HASH_TABLE_SIZE*4/1024}KB")
+                # Calcular uso total de VRAM
+                total_vram_mb = (total_input_size + total_output_size + hash_table_bytes) / 1024 / 1024
+                
+                print(f"[GPU_LZ4] Buffers alocados (batch={self.batch_size}):")
+                print(f"  - Input: {total_input_size/1024/1024:.1f}MB ({self.max_input_size/1024/1024:.1f}MB x {self.batch_size})")
+                print(f"  - Output: {total_output_size/1024/1024:.1f}MB ({self.max_compressed_size/1024/1024:.1f}MB x {self.batch_size})")
+                print(f"  - Hash: {hash_table_bytes/1024/1024:.1f}MB ({HASH_TABLE_SIZE*4/1024:.0f}KB x {self.batch_size})")
+                print(f"  - TOTAL VRAM: {total_vram_mb:.1f}MB")
                 
         except Exception as e:
             print(f"[GPU_LZ4] Erro ao alocar buffers: {e}")

@@ -112,6 +112,10 @@ class GPUFileDeduplicator:
         """
         if not self.enabled:
             return self._cpu_hash(filepath)
+        
+        # Validação prévia: arquivos vazios ou inválidos
+        if size == 0:
+            return self._cpu_hash(filepath)
             
         BLOCK_SIZE = 256 * 1024 # 256KB por bloco
         
@@ -124,8 +128,24 @@ class GPUFileDeduplicator:
         program = gpu_res["program"]
         
         try:
+            # Verificar se o arquivo é acessível e regular
+            import os
+            if not os.path.isfile(filepath):
+                # Não é arquivo regular (pode ser link simbólico quebrado, dispositivo, etc.)
+                return self._cpu_hash(filepath)
+            
+            # Verificar permissões de leitura
+            if not os.access(filepath, os.R_OK):
+                print(f"[Deduplicator] Sem permissão de leitura: {filepath}")
+                return hash(filepath)  # Hash dummy para evitar duplicata acidental
+            
             with open(filepath, "rb") as f:
                 data = f.read() # Ler tudo para memória (cuidado com arquivos gigantes)
+                
+                # Validação adicional: arquivo vazio ou leitura falhou
+                if len(data) == 0:
+                    return self._cpu_hash(filepath)
+                
                 # Para arquivos gigantes, teríamos que ler em chunks. 
                 # MVP: ler tudo se couber na RAM, senão fallback CPU.
                 if len(data) > 100 * 1024 * 1024: # > 100MB
@@ -176,6 +196,10 @@ class GPUFileDeduplicator:
                 
             return final_hash
             
+        except (OSError, IOError, PermissionError) as e:
+            # Erros de I/O: arquivo não existe, sem permissão, etc.
+            print(f"[Deduplicator] Erro I/O ({filepath}): {e}. Usando CPU.")
+            return self._cpu_hash(filepath)
         except Exception as e:
             print(f"[Deduplicator] Erro GPU ({gpu_res['device'].name}): {e}. Usando CPU.")
             return self._cpu_hash(filepath)
@@ -282,7 +306,7 @@ class GPUFileDeduplicator:
         count_s3 = sum(len(g) for g in candidates_s3)
         print(f"[Dedup Stage 3] Last 2 Bytes:  {removed_s3} removidos. {count_s3} restantes.")
 
-        # --- ESTÁGIO 4: 3 Bytes do Centro (center-1, center, center+1) ---
+        # --- ESTÁGIO 4: 8 Bytes do Centro ---
         candidates_s4 = []
         removed_s4 = 0
         
@@ -293,12 +317,12 @@ class GPUFileDeduplicator:
             for entry in group:
                 try:
                     with open(entry.path_abs, "rb") as f:
-                        if size >= 3:
-                            # Posição central e adjacentes
+                        if size >= 8:
+                            # Posição central e adjacentes - ler 8 bytes
                             center = size // 2
-                            # Ler 3 bytes: center-1, center, center+1
-                            f.seek(center - 1)
-                            center_bytes = f.read(3)
+                            # Começar 4 bytes antes do centro para pegar 8 bytes balanceados
+                            f.seek(center - 4)
+                            center_bytes = f.read(8)
                         else:
                             # Para arquivos muito pequenos, lê o que tem
                             f.seek(0)
@@ -314,7 +338,7 @@ class GPUFileDeduplicator:
                     removed_s4 += 1
                     
         count_s4 = sum(len(g) for g in candidates_s4)
-        print(f"[Dedup Stage 4] Center 3 Bytes: {removed_s4} removidos. {count_s4} restantes para Hash Completo.")
+        print(f"[Dedup Stage 4] Center 8 Bytes: {removed_s4} removidos. {count_s4} restantes para Hash Completo.")
 
         # --- ESTÁGIO 5: Hash Completo (GPU) ---
         dupes_count = 0

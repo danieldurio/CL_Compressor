@@ -7,7 +7,7 @@ Pipeline Simplificado:
 3. Fallback RAW: Para dados incompressíveis.
 
 Uso:
-    python compressor_lz4_dedup.py F:\\Radio -o F:\\saida_final --frame-size-mb 1
+    python compressor_lz4_dedup.py F:\\Radio -o F:\\saida_final 
 """
 
 from __future__ import annotations
@@ -21,8 +21,23 @@ from iotools import (
     scan_directory, FrameMeta
 )
 from deduplicator import GPUFileDeduplicator
-from gpu_lz4_compressor import GPU_LZ4_Compressor
-from gpu_capabilities import get_recommended_batch_size
+
+# Tentar importar GPU compressor, fallback para CPU se OpenCL não disponível
+OPENCL_AVAILABLE = False
+GPU_LZ4_Compressor = None
+
+try:
+    import pyopencl as cl
+    from gpu_lz4_compressor import GPU_LZ4_Compressor
+    from gpu_capabilities import get_recommended_batch_size
+    OPENCL_AVAILABLE = True
+except ImportError as e:
+    print(f"[Compressor] OpenCL não disponível: {e}")
+    print("[Compressor] Usando fallback CPU para compressão LZ4.")
+    cl = None
+
+# CPU Fallback compressor (sempre disponível)
+from compressor_fallback import CPU_LZ4_Compressor
 
 # ============================================================
 # CONFIGURAÇÃO DE BATCH SIZE
@@ -36,7 +51,19 @@ from gpu_capabilities import get_recommended_batch_size
 #8-12 GB	32-64 frames
 #12+ GB	64-128 frames
 
-BATCH_SIZE_OVERRIDE = None
+BATCH_SIZE_OVERRIDE = 35
+# ============================================================
+
+# ============================================================
+# CONFIGURAÇÃO DE I/O PIPELINE (BUFFER)
+# ============================================================
+# Número de batches em buffer para leitura antecipada (read-ahead)
+# Maior valor = mais RAM, menos espera por I/O de leitura
+READ_BUFFER_BATCHES = 2
+
+# Número de batches em buffer para escrita atrasada (write-behind)  
+# Maior valor = mais RAM, menos espera por I/O de escrita
+WRITE_BUFFER_BATCHES = 1
 # ============================================================
 
 def compress_directory_lz4(
@@ -54,28 +81,63 @@ def compress_directory_lz4(
     writer = VolumeWriter(output_base, max_volume_size)
     all_frames: List[FrameMeta] = []
     
-    # 1. Detectar GPUs e Inicializar Compressores
-    import pyopencl as cl
-    platforms = cl.get_platforms()
-    devices = []
-    for p in platforms:
-        devices.extend(p.get_devices(device_type=cl.device_type.GPU))
+    # 0. Determinar batch size e modo de operação
+    USE_CPU_FALLBACK = False
+    BATCH_SIZE = BATCH_SIZE_OVERRIDE if BATCH_SIZE_OVERRIDE is not None else 24  # Default
     
-    compressors = []
-    if not devices:
-        print("[Compressor] Nenhuma GPU detectada para compressão!")
+    if not OPENCL_AVAILABLE:
+        # Sem OpenCL - usar CPU fallback
+        USE_CPU_FALLBACK = True
+        import multiprocessing
+        BATCH_SIZE = multiprocessing.cpu_count() * 2  # Batch = 2x CPUs para melhor throughput
+        print(f"[Compressor] Modo CPU: Batch Size = {BATCH_SIZE} frames ({multiprocessing.cpu_count()} CPUs)")
+    elif BATCH_SIZE_OVERRIDE is not None:
+        BATCH_SIZE = BATCH_SIZE_OVERRIDE
+        print(f"[Compressor] Batch Size FIXO (definido pelo usuário): {BATCH_SIZE} frames")
     else:
-        print(f"[Compressor] Detectadas {len(devices)} GPUs. Inicializando compressores...")
-        for i in range(len(devices)):
-            # Passar frame_size para alocação de buffers persistentes
-            comp = GPU_LZ4_Compressor(device_index=i, max_input_size=frame_size)
-            if comp.enabled:
-                compressors.append(comp)
-            else:
-                print(f"[Compressor] Falha ao inicializar compressor na GPU {i}")
-
-    if not compressors:
-        print("[Compressor] AVISO: Nenhum compressor GPU disponível. Fallback para RAW (sem compressão).")
+        # Calcular batch size baseado nas capacidades da GPU
+        frame_size_for_calc = frame_size // (1024 * 1024)  # Converter para MB
+        BATCH_SIZE = get_recommended_batch_size(frame_size_mb=frame_size_for_calc)
+        print(f"[Compressor] Batch Size AUTOMÁTICO: {BATCH_SIZE} frames (baseado em GPU capabilities)")
+    
+    # 1. Inicializar Compressores (GPU ou CPU)
+    compressors = []
+    
+    if USE_CPU_FALLBACK:
+        # Modo CPU - usar um único compressor CPU com workers internos
+        cpu_comp = CPU_LZ4_Compressor()
+        compressors.append(cpu_comp)
+        print(f"[Compressor] Usando 1 compressor CPU com {cpu_comp.cpu_count} workers paralelos")
+    else:
+        # Modo GPU - detectar e inicializar GPUs
+        platforms = cl.get_platforms()
+        devices = []
+        for p in platforms:
+            try:
+                devices.extend(p.get_devices(device_type=cl.device_type.GPU))
+            except:
+                pass
+        
+        if not devices:
+            print("[Compressor] Nenhuma GPU detectada! Ativando fallback CPU...")
+            USE_CPU_FALLBACK = True
+            cpu_comp = CPU_LZ4_Compressor()
+            compressors.append(cpu_comp)
+        else:
+            print(f"[Compressor] Detectadas {len(devices)} GPUs. Inicializando compressores...")
+            for i in range(len(devices)):
+                comp = GPU_LZ4_Compressor(device_index=i, max_input_size=frame_size, batch_size=BATCH_SIZE)
+                if comp.enabled:
+                    compressors.append(comp)
+                else:
+                    print(f"[Compressor] Falha ao inicializar compressor na GPU {i}")
+            
+            # Se nenhuma GPU funcionou, fallback para CPU
+            if not compressors:
+                print("[Compressor] Nenhuma GPU inicializada! Ativando fallback CPU...")
+                USE_CPU_FALLBACK = True
+                cpu_comp = CPU_LZ4_Compressor()
+                compressors.append(cpu_comp)
 
     # Fila de compressores disponíveis para os workers
     import queue
@@ -84,8 +146,9 @@ def compress_directory_lz4(
     compressor_queue = queue.Queue()
     for c in compressors:
         compressor_queue.put(c)
-        
-    print(f"[Compressor] Iniciando compressão com {len(compressors)} workers GPU...")
+    
+    mode_str = "CPU" if USE_CPU_FALLBACK else "GPU"
+    print(f"[Compressor] Iniciando compressão com {len(compressors)} workers {mode_str}...")
     
     index_params = dict(index_params)
     index_params["compression_mode"] = "lz_ext3_gpu"
@@ -158,10 +221,15 @@ def compress_directory_lz4(
             stats["hits"][k] = 0
 
     # Função Worker para compressão paralela (BATCH)
-    def compress_batch_task(batch_data):
+    def compress_batch_task(batch_data, batch_id=None):
         # batch_data é uma lista de tuplas (frame_id, frame_bytes)
         frames = [b[1] for b in batch_data]
         frame_ids = [b[0] for b in batch_data]
+        
+        # Informar início do batch
+        batch_size = len(frames)
+        if batch_id is not None:
+            print(f"\n[Batch {batch_id}] Iniciando processamento de {batch_size} frames ...")
         
         # Resultado padrão (RAW) para todos
         results = []
@@ -187,10 +255,16 @@ def compress_directory_lz4(
             # Executar compressão em batch na GPU
             batch_results = comp.compress_batch(frames, frame_ids)
             
+            # Processar resultados com progresso
             for i, (res_bytes, res_size, _) in enumerate(batch_results):
                 orig_data = frames[i]
                 orig_size = len(orig_data)
                 fid = frame_ids[i]
+                
+                # Mostrar progresso a cada 20% do batch
+                progress_pct = int((i + 1) / batch_size * 100)
+                if batch_id is not None and progress_pct in [20, 40, 60, 80] and (i + 1) == int(batch_size * progress_pct / 100):
+                    print(f"[Batch {batch_id}] {progress_pct}% processado ({i + 1}/{batch_size} frames)")
                 
                 res = {
                     "mode": "raw",
@@ -232,200 +306,206 @@ def compress_directory_lz4(
             
         return results
 
-    # Execução Paralela com Batching
+    # Execução Paralela com Pipeline I/O
     num_workers = len(compressors) if compressors else 1
+    # BATCH_SIZE já foi definido no início da função
     
-    # Determinar batch size: override fixo ou cálculo automático
-    if BATCH_SIZE_OVERRIDE is not None:
-        BATCH_SIZE = BATCH_SIZE_OVERRIDE
-        print(f"[Compressor] Batch Size FIXO (definido pelo usuário): {BATCH_SIZE} frames")
-    else:
-        # Calcular batch size baseado nas capacidades da GPU
-        # Usa 2/3 da recomendação conservadora (ex: 24 -> 16 frames)
-        frame_size_for_calc = frame_size // (1024 * 1024)  # Converter para MB
-        BATCH_SIZE = get_recommended_batch_size(frame_size_mb=frame_size_for_calc)
-        print(f"[Compressor] Batch Size AUTOMÁTICO: {BATCH_SIZE} frames (baseado em GPU capabilities)")
+    import threading
     
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {} # batch_id -> Future
-        next_frame_to_write = 0
+    # Filas do pipeline com tamanhos configuráveis
+    read_queue_size = BATCH_SIZE * READ_BUFFER_BATCHES
+    write_queue_size = BATCH_SIZE * WRITE_BUFFER_BATCHES
+    
+    frame_queue = queue.Queue(maxsize=read_queue_size)  # Frames lidos aguardando processamento
+    write_queue = queue.Queue(maxsize=write_queue_size)  # Resultados aguardando escrita
+    
+    # Eventos de controle
+    reader_done = threading.Event()
+    processing_done = threading.Event()
+    pipeline_error = threading.Event()
+    
+    print(f"[Pipeline] Buffers: Read={READ_BUFFER_BATCHES} batches, Write={WRITE_BUFFER_BATCHES} batches")
+    
+    # ================================================================
+    # THREAD 1: READER (Produtor - lê frames do disco)
+    # ================================================================
+    def reader_thread():
+        """Lê frames em background e enfileira para processamento."""
+        try:
+            for frame_id, frame_data in generate_frames(entries, frame_size):
+                if pipeline_error.is_set():
+                    break
+                if len(frame_data) == 0:
+                    continue
+                frame_queue.put((frame_id, frame_data))
+        except Exception as e:
+            print(f"[Reader] Erro: {e}")
+            pipeline_error.set()
+        finally:
+            reader_done.set()
+    
+    # ================================================================
+    # THREAD 3: WRITER (Consumidor - escreve resultados em ordem)
+    # ================================================================
+    pending_results = {}  # frame_id -> result_dict
+    next_frame_to_write = [0]  # Usar lista para permitir modificação em closure
+    
+    def process_result(res):
+        """Processa um resultado: atualiza stats e escreve no volume."""
+        nonlocal current_vol_name
         
+        best_mode = res["mode"]
+        best_bytes = res["bytes"]
+        orig_size = res["orig_size"]
+        gpu_idx = res.get("gpu_index", -1)
+        
+        if gpu_idx >= 0 and gpu_idx < len(gpu_frame_counts):
+            gpu_frame_counts[gpu_idx] += 1
+            gpu_last_frames[gpu_idx] = res["frame_id"]
+        
+        if best_mode == "lz_ext3_gpu":
+            global_stats["lz_ext3_gpu"] += 1
+        else:
+            global_stats["raw"] += 1
+        
+        global_stats["total_orig_bytes"] += orig_size
+        
+        # Validação para prevenir overflow
+        res_size_value = res["size"]
+        if isinstance(res_size_value, int) and res_size_value > 0 and res_size_value < (2 * 1024 * 1024 * 1024):
+            try:
+                global_stats["total_compressed_bytes"] += res_size_value
+            except OverflowError:
+                global_stats["total_compressed_bytes"] = res_size_value
+        
+        meta = writer.write_frame(
+            frame_id=res["frame_id"],
+            uncompressed_size=orig_size,
+            compressed_bytes=best_bytes,
+        )
+        
+        if current_vol_name is None:
+            current_vol_name = meta.volume_name
+            
+        if meta.volume_name != current_vol_name:
+            print_vol_stats(current_vol_name, vol_stats)
+            reset_stats(vol_stats)
+            current_vol_name = meta.volume_name
+            
+        vol_stats["orig"] += orig_size
+        if best_mode == "lz_ext3_gpu":
+            vol_stats["lz_ext3_gpu"] += res["size"]
+        else:
+            vol_stats["raw"] += res["size"]
+        vol_stats["hits"][best_mode] += 1
+        
+        all_frames.append(meta)
+        frame_modes[res["frame_id"]] = best_mode
+    
+    def writer_thread():
+        """Escreve resultados em ordem de frame_id."""
+        try:
+            while not (processing_done.is_set() and write_queue.empty() and not pending_results):
+                if pipeline_error.is_set():
+                    break
+                
+                # Coletar resultados da fila
+                try:
+                    batch_results = write_queue.get(timeout=0.1)
+                    for res in batch_results:
+                        pending_results[res["frame_id"]] = res
+                except queue.Empty:
+                    pass
+                
+                # Escrever em ordem
+                while next_frame_to_write[0] in pending_results:
+                    res = pending_results.pop(next_frame_to_write[0])
+                    process_result(res)
+                    next_frame_to_write[0] += 1
+                    
+        except Exception as e:
+            print(f"[Writer] Erro: {e}")
+            pipeline_error.set()
+    
+    # ================================================================
+    # THREAD 2: COMPRESSOR (Workers - processa batches)
+    # ================================================================
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {}  # batch_id -> Future
         current_batch = []
         batch_counter = 0
         
-        # Buffer de resultados pendentes para escrita ordenada
-        pending_results = {} # frame_id -> result_dict
+        # Iniciar threads de I/O
+        reader = threading.Thread(target=reader_thread, name="FrameReader", daemon=True)
+        writer_th = threading.Thread(target=writer_thread, name="FrameWriter", daemon=True)
         
-        for frame_id, frame_data in generate_frames(entries, frame_size):
-            if len(frame_data) == 0: continue
+        reader.start()
+        writer_th.start()
+        
+        # Loop principal: coleta frames e submete batches
+        while not pipeline_error.is_set():
+            # Tentar coletar frame da fila
+            try:
+                frame_id, frame_data = frame_queue.get(timeout=0.1)
+                current_batch.append((frame_id, frame_data))
+            except queue.Empty:
+                # Fila vazia - verificar se reader terminou
+                if reader_done.is_set() and frame_queue.empty():
+                    break
+                continue
             
-            current_batch.append((frame_id, frame_data))
-            
+            # Submeter batch quando atingir tamanho
             if len(current_batch) >= BATCH_SIZE:
-                # Submeter batch
-                f = executor.submit(compress_batch_task, list(current_batch))
+                f = executor.submit(compress_batch_task, list(current_batch), batch_counter)
                 futures[batch_counter] = f
                 batch_counter += 1
                 current_batch = []
                 
-                # Controle de Backpressure (limitar batches em voo)
-                # Manter ~2 batches por GPU para evitar OOM com arquivos incompressíveis
+                # Backpressure: limitar batches em voo
                 max_pending_batches = num_workers * 2
-                while len(futures) > max_pending_batches:
-                    # Remover futures concluídos
+                while len(futures) > max_pending_batches and not pipeline_error.is_set():
                     done_batches = [bid for bid, fut in futures.items() if fut.done()]
                     for bid in done_batches:
-                        batch_res = futures[bid].result()
-                        del futures[bid]
-                        for res in batch_res:
-                            pending_results[res["frame_id"]] = res
+                        try:
+                            batch_res = futures[bid].result()
+                            del futures[bid]
+                            write_queue.put(batch_res)
+                        except Exception as e:
+                            print(f"[Compressor] Erro no batch {bid}: {e}")
+                            del futures[bid]
                     
                     if not done_batches:
                         time.sleep(0.01)
-            
-            # Forçar escrita periódica para evitar acúmulo excessivo em RAM
-            # Processar resultados pendentes a cada 20 frames acumulados
-            if len(pending_results) > 20:
-                while next_frame_to_write in pending_results:
-                    res = pending_results.pop(next_frame_to_write)
-                    
-                    # Processar resultado (escrita e stats) - Lógica idêntica à anterior
-                    best_mode = res["mode"]
-                    best_bytes = res["bytes"]
-                    orig_size = res["orig_size"]
-                    gpu_idx = res.get("gpu_index", -1)
-                    
-                    if gpu_idx >= 0 and gpu_idx < len(gpu_frame_counts):
-                        gpu_frame_counts[gpu_idx] += 1
-                        gpu_last_frames[gpu_idx] = res["frame_id"]
-                    
-                    if best_mode == "lz_ext3_gpu":
-                        global_stats["lz_ext3_gpu"] += 1
-                    else:
-                        global_stats["raw"] += 1
-                    
-                    global_stats["total_orig_bytes"] += orig_size
-                    
-                    # Validação para prevenir overflow (C long limit) - 2GB para segurança  
-                    res_size_value = res["size"]
-                    if isinstance(res_size_value, int) and res_size_value > 0 and res_size_value < (2 * 1024 * 1024 * 1024):
-                        try:
-                            global_stats["total_compressed_bytes"] += res_size_value
-                        except OverflowError as e:
-                            print(f"[ERRO] Overflow ao somar estatísticas no frame {res['frame_id']}: total={global_stats['total_compressed_bytes']}, adding={res_size_value}")
-                            # Resetar estatística para continuar sem crash
-                            global_stats["total_compressed_bytes"] = res_size_value
-                    else:
-                        if res_size_value >= (2 * 1024 * 1024 * 1024):
-                            print(f"[AVISO] Frame {res['frame_id']}: tamanho excessivo {res_size_value} bytes (>2GB), ignorando estatística")
-                    
-                    meta = writer.write_frame(
-                        frame_id=res["frame_id"],
-                        uncompressed_size=orig_size,
-                        compressed_bytes=best_bytes,
-                    )
-                    
-                    if current_vol_name is None:
-                        current_vol_name = meta.volume_name
-                        
-                    if meta.volume_name != current_vol_name:
-                        print_vol_stats(current_vol_name, vol_stats)
-                        reset_stats(vol_stats)
-                        current_vol_name = meta.volume_name
-                        
-                    vol_stats["orig"] += orig_size
-                    if best_mode == "lz_ext3_gpu":
-                        vol_stats["lz_ext3_gpu"] += res["size"]
-                    else:
-                        vol_stats["raw"] += res["size"]
-                    vol_stats["hits"][best_mode] += 1
-                    
-                    all_frames.append(meta)
-                    frame_modes[res["frame_id"]] = best_mode
-                    
-                    next_frame_to_write += 1
-
-
+        
         # Submeter último batch parcial
         if current_batch:
-            f = executor.submit(compress_batch_task, list(current_batch))
+            f = executor.submit(compress_batch_task, list(current_batch), batch_counter)
             futures[batch_counter] = f
             batch_counter += 1
         
-        # Aguardar todos os batches
-        while futures or pending_results:
-            # Coletar futures prontos
+        # Aguardar todos os batches de compressão
+        while futures and not pipeline_error.is_set():
             done_batches = [bid for bid, fut in futures.items() if fut.done()]
             for bid in done_batches:
-                batch_res = futures[bid].result()
-                del futures[bid]
-                for res in batch_res:
-                    pending_results[res["frame_id"]] = res
-            
-            # Escrever resultados ordenados
-            while next_frame_to_write in pending_results:
-                res = pending_results.pop(next_frame_to_write)
-                
-                # Processar resultado (escrita e stats) - Cópia da lógica acima
-                best_mode = res["mode"]
-                best_bytes = res["bytes"]
-                orig_size = res["orig_size"]
-                gpu_idx = res.get("gpu_index", -1)
-                
-                if gpu_idx >= 0 and gpu_idx < len(gpu_frame_counts):
-                    gpu_frame_counts[gpu_idx] += 1
-                    gpu_last_frames[gpu_idx] = res["frame_id"]
-                
-                if best_mode == "lz_ext3_gpu":
-                    global_stats["lz_ext3_gpu"] += 1
-                else:
-                    global_stats["raw"] += 1
-                
-                global_stats["total_orig_bytes"] += orig_size
-                    
-                # Validação para prevenir overflow (C long limit) - 2GB para segurança
-                res_size_value = res["size"]
-                if isinstance(res_size_value, int) and res_size_value > 0 and res_size_value < (2 * 1024 * 1024 * 1024):
-                    try:
-                        global_stats["total_compressed_bytes"] += res_size_value
-                    except OverflowError as e:
-                        print(f"[ERRO] Overflow ao somar: current={global_stats['total_compressed_bytes']}, adding={res_size_value}")
-                        # Resetar estatística para continuar
-                        global_stats["total_compressed_bytes"] = res_size_value
-                else:
-                    print(f"[Bloco] Frame {res['frame_id']}: tamanho ao limite {res_size_value}, capturando o raw")
-                
-                meta = writer.write_frame(
-                    frame_id=res["frame_id"],
-                    uncompressed_size=orig_size,
-                    compressed_bytes=best_bytes,
-                )
-                
-                if current_vol_name is None:
-                    current_vol_name = meta.volume_name
-                    
-                if meta.volume_name != current_vol_name:
-                    print_vol_stats(current_vol_name, vol_stats)
-                    reset_stats(vol_stats)
-                    current_vol_name = meta.volume_name
-                    
-                vol_stats["orig"] += orig_size
-                if best_mode == "lz_ext3_gpu":
-                    vol_stats["lz_ext3_gpu"] += res["size"]
-                else:
-                    vol_stats["raw"] += res["size"]
-                vol_stats["hits"][best_mode] += 1
-                
-                all_frames.append(meta)
-                frame_modes[res["frame_id"]] = best_mode
-                
-                next_frame_to_write += 1
-            
-            if not futures and not pending_results:
-                break
+                try:
+                    batch_res = futures[bid].result()
+                    del futures[bid]
+                    write_queue.put(batch_res)
+                except Exception as e:
+                    print(f"[Compressor] Erro no batch {bid}: {e}")
+                    del futures[bid]
             
             if not done_batches:
                 time.sleep(0.01)
+        
+        # Sinalizar fim do processamento
+        processing_done.set()
+        
+        # Aguardar writer terminar
+        writer_th.join(timeout=60)
+        
+        if writer_th.is_alive():
+            print("[Pipeline] AVISO: Writer thread ainda ativo após timeout")
     
     # Imprimir stats do último volume
     if current_vol_name:
