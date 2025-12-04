@@ -1,12 +1,12 @@
 """
 Gerador de Mapa de Árvore (Tree Map) a partir de arquivos compactados.
 
-Lê o footer de arquivos .001 (LZ4 GPU compressor) e gera um HTML standalone
+Lê o footer de arquivos .XXX (LZ4 GPU compressor) e gera um HTML standalone
 com visualização hierárquica do uso de espaço (tree size) e estatísticas
 de compressão.
 
 Uso:
-    python generate_tree_map.py arquivo.001 -o output.html
+    python generate_tree_map.py arquivo.XXX -o output.html
 
 Sem dependências externas - usa apenas biblioteca padrão do Python.
 """
@@ -82,14 +82,14 @@ def read_footer(archive_path: Path) -> Optional[Dict[str, Any]]:
 class TreeNode:
     """Nó da árvore hierárquica de pastas."""
     
-    def __init__(self, name: str):
+    def __init__(self, name: str, is_folder: bool = True, size: int = 0):
         self.name = name
-        self.size = 0
+        self.size = size
         self.total_items = 0
         self.total_files = 0
         self.total_folders = 0
         self.children: List[TreeNode] = []
-        self.is_folder = True
+        self.is_folder = is_folder
     
     def add_file(self, path_parts: List[str], file_size: int):
         """Adiciona um arquivo à árvore."""
@@ -97,7 +97,13 @@ class TreeNode:
             return
         
         if len(path_parts) == 1:
-            # É um arquivo direto neste nível
+            # É um arquivo direto neste nível - criar um nó filho para o arquivo
+            file_node = TreeNode(path_parts[0], is_folder=False, size=file_size)
+            file_node.total_items = 1
+            file_node.total_files = 1
+            self.children.append(file_node)
+            
+            # Acumular no nó pai
             self.size += file_size
             self.total_items += 1
             self.total_files += 1
@@ -105,15 +111,15 @@ class TreeNode:
             # É uma pasta
             folder_name = path_parts[0]
             
-            # Procurar ou criar child
+            # Procurar ou criar child folder
             child = None
             for c in self.children:
-                if c.name == folder_name:
+                if c.name == folder_name and c.is_folder:
                     child = c
                     break
             
             if child is None:
-                child = TreeNode(folder_name)
+                child = TreeNode(folder_name, is_folder=True)
                 self.children.append(child)
             
             # Adicionar recursivamente
@@ -122,6 +128,7 @@ class TreeNode:
             # Acumular tamanhos e contagens
             self.size += file_size
             self.total_items += 1
+            self.total_files += 1  # Também incrementar arquivos no nível pai
     
     def finalize(self):
         """Finaliza a árvore calculando contagens de pastas."""
@@ -147,6 +154,7 @@ class TreeNode:
             'total_items': self.total_items,
             'total_files': self.total_files,
             'total_folders': self.total_folders,
+            'is_folder': self.is_folder,
             'children': [c.to_dict() for c in self.children]
         }
 
@@ -209,6 +217,10 @@ def calculate_compression_stats(index: Dict[str, Any]) -> Dict[str, Any]:
     space_saved = total_original - total_compressed
     space_saved_percent = (space_saved / total_original * 100) if total_original > 0 else 0
     
+    # Estatísticas de deduplicação
+    total_duplicate_size = sum(f['size'] for f in files if f.get('is_duplicate'))
+    dedup_count = len([f for f in files if f.get('is_duplicate')])
+    
     return {
         'total_original': total_original,
         'total_original_formatted': format_bytes(total_original),
@@ -220,6 +232,8 @@ def calculate_compression_stats(index: Dict[str, Any]) -> Dict[str, Any]:
         'space_saved_percent': space_saved_percent,
         'total_files': len([f for f in files if not f.get('is_duplicate')]),
         'total_duplicates': len([f for f in files if f.get('is_duplicate')]),
+        'total_duplicate_size': total_duplicate_size,
+        'total_duplicate_size_formatted': format_bytes(total_duplicate_size),
         'total_frames': len(frames),
         'volume_count': len(volumes),
         'volumes': sorted(volumes),
@@ -558,6 +572,21 @@ def generate_html(tree_data: Dict[str, Any], stats: Dict[str, Any], output_path:
             </div>
         </div>
 
+        <!-- Estatísticas de Deduplicação -->
+        <div class="section">
+            <h2>🔄 Estatísticas de Deduplicação</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Arquivos Duplicados</div>
+                    <div class="stat-value">{total_duplicates:,}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Espaço Economizado (Dedup)</div>
+                    <div class="stat-value">{total_duplicate_size_formatted}</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Breakdown por Modo de Compressão -->
         <div class="section">
             <h2>🔧 Breakdown por Modo de Compressão</h2>
@@ -625,12 +654,12 @@ def generate_html(tree_data: Dict[str, Any], stats: Dict[str, Any], output_path:
 
             const toggle = document.createElement('span');
             toggle.className = 'tree-toggle';
-            toggle.textContent = hasChildren ? '-' : '';
+            toggle.textContent = hasChildren ? '+' : '';
             headerTop.appendChild(toggle);
 
             const icon = document.createElement('span');
             icon.className = 'tree-icon';
-            icon.textContent = '📁';
+            icon.textContent = node.is_folder ? '📁' : '📄';
             headerTop.appendChild(icon);
 
             const name = document.createElement('span');
@@ -668,7 +697,7 @@ def generate_html(tree_data: Dict[str, Any], stats: Dict[str, Any], output_path:
 
             if (hasChildren) {{
                 const childrenContainer = document.createElement('ul');
-                childrenContainer.className = 'tree-children';
+                childrenContainer.className = 'tree-children collapsed';
 
                 node.children.forEach(function (child) {{
                     renderTreeList(child, childrenContainer, depth + 1);
@@ -729,6 +758,7 @@ def generate_html(tree_data: Dict[str, Any], stats: Dict[str, Any], output_path:
         space_saved_percent=stats['space_saved_percent'],
         total_files=stats['total_files'],
         total_duplicates=stats['total_duplicates'],
+        total_duplicate_size_formatted=stats['total_duplicate_size_formatted'],
         total_frames=stats['total_frames'],
         volume_count=stats['volume_count'],
         mode_breakdown=''.join(mode_breakdown_html),
