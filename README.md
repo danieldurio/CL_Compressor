@@ -4,31 +4,52 @@
 
 This project is a **high-performance archival compression solution** that uses **GPU acceleration** to perform deduplication and LZ4 compression. Unlike traditional tools, it is designed to handle large volumes of data, such as *extensive directory backups*, offering a significantly higher compression throughput by leveraging the power of commodity Graphics Processing Units (GPUs).
 
-The project implements a complete **custom archival format**, including its own compressor, decompressor, metadata index, and a hybrid (CPU/GPU) pipeline to ensure maximum performance and compatibility.
+This project implements a high-performance data compression and archival system leveraging GPU acceleration via OpenCL for both deduplication hashing and the core LZ4 compression algorithm. It features a custom, highly optimized compression kernel and a multi-stage deduplication pipeline to achieve superior speed and efficiency.
 
 ## ✨ Key Features
 
-What makes this compressor unique and extremely efficient:
+The system is engineered for maximum throughput and efficiency, focusing on several critical optimizations:
 
-| Feature | Description | Primary Benefit |
-| :--- | :--- | :--- |
-| **GPU-Accelerated Deduplication** | Multi-stage filter pipeline (size, first/last/center bytes) culminating in 64-bit hash validation by GPU (FNV-1a). | **Drastic reduction in I/O and final size** before compression, detecting duplicates with zero false positives. |
-| **GPU LZ4 Compressor (Extended Window)** | Custom LZ4 implementation running entirely on the GPU, with a **16 MB** sliding window (larger than standard) and 3-byte offset encoding. | **Compression speed of 2-3+ GB/s** (depending on the GPU), optimized for high throughput. |
-| **Frame-Based Streaming Compressor** | Concatenates files into a continuous byte stream, split into 16 MB frames, processed **independently and in parallel** (supports multi-GPU). | **Highly parallel** and efficient processing for large files. |
-| **Multi-Volume Output** | The final archive is split into smaller volumes (default: 98 MB), such as `.001`, `.002`, etc. | Facilitates distribution, compatibility with legacy file systems (e.g., FAT32), and allows **resumable** processing. |
-| **Hybrid Decompressor (GPU/CPU)** | Attempts GPU decompression first and, in case of incompatible hardware or error, performs an **automatic fallback to CPU**, ensuring integrity and compatibility. | **Guarantees correctness** on older hardware or in case of GPU kernel corruption. |
+### 1. Custom LZ4 Kernel with Extended Window (The Custom Kernel)
+
+The core compression logic is implemented in a custom OpenCL kernel (`lz4_compress_ext3.cl`). This kernel significantly enhances the standard LZ4 algorithm by utilizing **3-byte offsets**, which extends the maximum match distance (window size) to **16 MB** (compared to the standard LZ4's 64 KB limit). This modification drastically improves the compression ratio for large, repetitive data blocks, making it ideal for archival and backup scenarios.
+
+### 2. Parallel GPU Hashing for Deduplication
+
+File deduplication is accelerated by calculating FNV-1a 64-bit hashes in parallel across multiple GPUs using OpenCL. The system employs a **round-robin strategy** to distribute the hashing workload, ensuring maximum throughput and minimizing CPU overhead during the most I/O-intensive phase.
+
+### 3. Top-K Match Search Optimization
+
+Within the custom LZ4 kernel, the match-finding process uses a **Top-K adaptive search** (specifically, 8 candidates) in the hash table. This technique prioritizes finding the *best* possible match rather than just the first one, further enhancing the compression ratio without sacrificing performance due to the GPU's parallel processing capabilities.
+
+### 4. Extremely Efficient Multi-Stage Deduplication
+
+To minimize I/O and expensive full-file hash calculations, the deduplication process uses a highly efficient **four-stage filter** before performing the full GPU hash:
+1.  **Size Check:** Group files by size.
+2.  **First 2 Bytes Check:** Filter groups by the first two bytes.
+3.  **Last 2 Bytes Check:** Filter remaining groups by the last two bytes.
+4.  **Center 3 Bytes Check:** Filter by three bytes around the center of the file.
+
+Only files that pass all these quick checks proceed to the final, full-file GPU hash calculation, making the deduplication process exceptionally fast.
+
+### 5. Adaptive Compression Fallback (Read-Ahead Skip Optimization)
+
+The system incorporates an optimization for handling incompressible data. While the compression is performed on the GPU, if the resulting compressed frame size is not smaller than the original data size, the system automatically falls back to storing the data in its **raw (uncompressed) format**. This prevents wasting time and space on data that cannot be effectively compressed, serving as an effective "read-ahead skip" mechanism for impossible-to-compress bytes.
+
+### 6. Embedded Metadata Indexing
+
+The system generates a comprehensive index of all files, frames, and compression parameters. This index is then **compressed using zlib** and **embedded directly into the final volume file**. A fixed 24-byte footer (`GPU_IDX1`) is appended to the last volume, allowing a metadata reader to quickly locate and extract the index without relying on external index files.
 
 ## ⚙️ How It Works (Architecture Overview)
 
-The compression process is divided into stages optimized for GPU parallelism:
+The compression process follows a streamlined, high-throughput pipeline:
 
-1.  **Directory Scan:** Collects metadata, preserves relative paths, and detects empty files.
-2.  **Deduplication Pipeline:** Fast filters (size, bytes) + GPU hash for remaining candidates. Duplicate files are removed before compression.
-3.  **Frame Generation:** Creation of sequential 16 MB frames from non-duplicate file data.
-4.  **GPU LZ4 Compression:** Each frame is compressed on the GPU using the extended-window LZ4.
-5.  **Multi-Volume Writing:** Frames are inserted into volumes, respecting the maximum size.
-6.  **Indexing:** The final volume receives a compressed index (zlib) containing metadata, deduplication map, and frame descriptors.
-7.  **Decompression:** Reverse process with GPU or CPU, followed by the reconstruction of deduplicated files (restores originals and creates duplicates via hardlink/copy).
+1.  **Directory Scan:** Recursively scan the source directory to create a list of `FileEntry` objects.
+2.  **Deduplication:** Apply the four-stage filter, followed by parallel GPU hashing to mark duplicate files.
+3.  **Frame Generation:** Unique files are concatenated into a single stream, which is then split into fixed-size frames (e.g., 16 MB).
+4.  **GPU Compression:** Frames are processed in parallel batches by multiple GPU workers using the custom LZ4 kernel.
+5.  **Volume Writing:** Compressed frames are written sequentially to multi-part volumes (`.001`, `.002`, etc.), respecting a maximum volume size.
+6.  **Index Embedding:** The final index is compressed and embedded into the last volume file.
 
 ## 📊 Performance and Results
 
