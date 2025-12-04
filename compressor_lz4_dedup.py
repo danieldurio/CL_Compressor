@@ -51,7 +51,7 @@ from compressor_fallback import CPU_LZ4_Compressor
 #8-12 GB	32-64 frames
 #12+ GB	64-128 frames
 
-BATCH_SIZE_OVERRIDE = 35
+BATCH_SIZE_OVERRIDE = None
 # ============================================================
 
 # ============================================================

@@ -196,7 +196,8 @@ class VolumeWriter:
 
         self.current_volume_index += 1
         vol_path = Path(f"{self.base_path}.{self.current_volume_index:03d}")
-        self.current_fp = open(vol_path, "wb")
+        # Buffer de escrita de 1MB (otimização para throughput)
+        self.current_fp = open(vol_path, "wb", buffering=1024*1024)
         self.current_size = 0
         self.current_volume_name = vol_path.name  # só o nome do arquivo
         
@@ -262,23 +263,55 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
     buffer = bytearray()
     frame_id = 0
 
+    import mmap
+    
     for entry in entries:
         if entry.is_duplicate:
             continue
 
-        with open(entry.path_abs, "rb") as f:
-            while True:
-                chunk = f.read(64 * 1024)  # lê em blocos de 64 KB
-                if not chunk:
-                    break
-
-                buffer.extend(chunk)
-
-                while len(buffer) >= frame_size:
-                    out = bytes(buffer[:frame_size])
-                    del buffer[:frame_size]
-                    yield frame_id, out
-                    frame_id += 1
+        try:
+            with open(entry.path_abs, "rb") as f:
+                # Otimização: Memory-mapped I/O
+                # Evita syscalls excessivos e cópias de buffer
+                file_size = entry.size
+                if file_size == 0:
+                    continue
+                    
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    cursor = 0
+                    while cursor < file_size:
+                        # Calcular quanto ler para completar o buffer ou ler tudo
+                        remaining_file = file_size - cursor
+                        
+                        # Se o buffer já tem dados, completar até frame_size
+                        if len(buffer) > 0:
+                            needed = frame_size - len(buffer)
+                            chunk_size = min(remaining_file, needed)
+                            buffer.extend(mm[cursor:cursor+chunk_size])
+                            cursor += chunk_size
+                            
+                            if len(buffer) >= frame_size:
+                                out = bytes(buffer[:frame_size])
+                                del buffer[:frame_size]
+                                yield frame_id, out
+                                frame_id += 1
+                        else:
+                            # Buffer vazio: tentar emitir frames diretos do mmap (zero-copy)
+                            while remaining_file >= frame_size:
+                                # Yield direto do slice mmap (cria bytes, mas evita buffer intermediário)
+                                yield frame_id, mm[cursor:cursor+frame_size]
+                                frame_id += 1
+                                cursor += frame_size
+                                remaining_file -= frame_size
+                            
+                            # Sobrou pedaço menor que frame_size no final do arquivo
+                            if remaining_file > 0:
+                                buffer.extend(mm[cursor:cursor+remaining_file])
+                                cursor += remaining_file
+                                
+        except Exception as e:
+            print(f"[IO] Erro ao ler {entry.path_abs}: {e}")
+            continue
 
     # Sobrou algo no buffer (último frame parcial)
     if buffer:

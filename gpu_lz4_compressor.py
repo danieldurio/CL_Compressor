@@ -387,13 +387,12 @@ __kernel void lz4_compress_block(
         uint lit_rem = literal_len;
         
         while (lit_rem >= 8) {
-            // Unaligned copy safe on most modern GPUs, but let's be explicit if needed.
-            // For now, simple assignment usually works or generates decent code.
-            // Manual unroll is safer for portability.
-            *op++ = *lit_src++; *op++ = *lit_src++;
-            *op++ = *lit_src++; *op++ = *lit_src++;
-            *op++ = *lit_src++; *op++ = *lit_src++;
-            *op++ = *lit_src++; *op++ = *lit_src++;
+            // OTIMIZAÇÃO: Vectorized copy usando vload8/vstore8 (safe for unaligned)
+            uchar8 vec = vload8(0, lit_src);
+            vstore8(vec, 0, op);
+            
+            op += 8;
+            lit_src += 8;
             lit_rem -= 8;
         }
         while (lit_rem > 0) {
