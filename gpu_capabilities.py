@@ -43,7 +43,7 @@ def get_recommended_batch_size(frame_size_mb: int = 16) -> int:
                 
                 # Heurística: mesma lógica do print_gpu_info()
                 ideal_threads_min = cus * 4
-                safe_mem_mb = mem_global_mb * 0.8
+                safe_mem_mb = mem_global_mb * 0.83  # 83% da VRAM total
                 max_frames_mem = safe_mem_mb / frame_size_mb
                 
                 # Recomendação Conservadora

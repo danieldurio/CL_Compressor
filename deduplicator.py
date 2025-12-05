@@ -204,6 +204,67 @@ class GPUFileDeduplicator:
             print(f"[Deduplicator] Erro GPU ({gpu_res['device'].name}): {e}. Usando CPU.")
             return self._cpu_hash(filepath)
 
+    def compute_data_hash(self, data: bytes) -> int:
+        """
+        Calcula hash de dados já em memória usando GPU.
+        Versão otimizada para Double Buffer (evita re-leitura de arquivo).
+        """
+        if not self.enabled or len(data) == 0:
+            return self._hash_bytes(data)
+        
+        # Para arquivos grandes, fallback para CPU (evitar estouro VRAM)
+        if len(data) > 100 * 1024 * 1024:
+            return self._hash_bytes(data)
+            
+        BLOCK_SIZE = 256 * 1024  # 256KB por bloco
+        
+        # Selecionar GPU (Round-Robin)
+        gpu_res = self._contexts[self._current_device_idx]
+        self._current_device_idx = (self._current_device_idx + 1) % self._num_devices
+        
+        ctx = gpu_res["ctx"]
+        queue = gpu_res["queue"]
+        program = gpu_res["program"]
+        
+        try:
+            n = len(data)
+            num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+            padded_len = num_blocks * BLOCK_SIZE
+            
+            if n < padded_len:
+                data = data + b'\0' * (padded_len - n)
+                
+            arr_in = np.frombuffer(data, dtype=np.uint8)
+            
+            mf = self._cl.mem_flags
+            buf_in = self._cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=arr_in)
+            
+            hashes = np.zeros(num_blocks, dtype=np.uint64)
+            buf_hashes = self._cl.Buffer(ctx, mf.WRITE_ONLY, hashes.nbytes)
+            
+            kernel = self._cl.Kernel(program, "block_fnv1a")
+            kernel.set_args(buf_in, np.uint32(BLOCK_SIZE), np.uint32(num_blocks), buf_hashes)
+            
+            self._cl.enqueue_nd_range_kernel(queue, kernel, (num_blocks,), None)
+            queue.finish()
+            
+            self._cl.enqueue_copy(queue, hashes, buf_hashes).wait()
+            
+            # Combinar hashes dos blocos
+            final_hash = 0xcbf29ce484222325
+            prime = 0x100000001b3
+            
+            for h in hashes:
+                final_hash ^= int(h)
+                final_hash *= prime
+                final_hash &= 0xFFFFFFFFFFFFFFFF
+                
+            return final_hash
+            
+        except Exception as e:
+            # Fallback CPU em caso de erro
+            return self._hash_bytes(data)
+
     def _cpu_hash(self, filepath: str) -> int:
         """Fallback CPU (FNV-1a simples)."""
         h = 0xcbf29ce484222325
@@ -220,6 +281,14 @@ class GPUFileDeduplicator:
                     h *= prime
                     h &= mask
         return h
+
+    def _hash_bytes(self, data: bytes) -> int:
+        """Hash rápido de bytes usando hashlib (C nativo)."""
+        import hashlib
+        # MD5 é muito mais rápido que FNV byte-a-byte em Python
+        # Retorna int para compatibilidade com o código existente
+        return int(hashlib.md5(data).hexdigest(), 16)
+
 
     def find_duplicates(self, entries: List[FileEntry]) -> List[FileEntry]:
         """
@@ -338,52 +407,189 @@ class GPUFileDeduplicator:
                     removed_s4 += 1
                     
         count_s4 = sum(len(g) for g in candidates_s4)
-        print(f"[Dedup Stage 4] Center 8 Bytes: {removed_s4} removidos. {count_s4} restantes para Hash Completo.")
+        print(f"[Dedup Stage 4] Center 8 Bytes: {removed_s4} removidos.")
 
-        # --- ESTÁGIO 5: Hash Completo (GPU) ---
+        # --- ESTÁGIO 5+: Progressive Scan ---
+        # Stage 5: Arquivos pequenos (≤50MB) - hash completo
+        # Stage 6+: Arquivos grandes - scan progressivo em chunks de 50MB
+        
+        CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
         dupes_count = 0
         bytes_saved = 0
+        MAX_WORKERS = 8
         
-        # Definir o número máximo de workers (threads) para I/O e GPU
-        # Um valor razoável é o número de núcleos da CPU ou um pouco mais.
-        MAX_WORKERS = 8 
+        # Separar em pequenos (≤50MB) e grandes (>50MB)
+        small_files_groups = []
+        large_files_groups = []
         
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for group in candidates_s4:
-                hashes = {}
-                size = group[0].size
-                
-                # 1. Submeter todas as tarefas de hashing do grupo para o executor
-                future_to_entry = {
-                    executor.submit(self.compute_file_hash, str(entry.path_abs), size): entry
-                    for entry in group
-                }
-                
-                # 2. Processar os resultados à medida que ficam prontos (paralelo)
-                for future in as_completed(future_to_entry):
-                    entry = future_to_entry[future]
+        for group in candidates_s4:
+            size = group[0].size
+            if size <= CHUNK_SIZE:
+                small_files_groups.append(group)
+            else:
+                large_files_groups.append(group)
+        
+        # --- Stage 5: Arquivos pequenos - Hash Completo via GPU (Double Buffer) ---
+        small_count = sum(len(g) for g in small_files_groups)
+        small_removed = 0
+        small_remaining = 0
+        processed_count = 0
+        
+        if small_count > 0:
+            import queue
+            import threading
+            
+            # Output inicial ANTES de começar
+            print(f"[Dedup Stage 5] Progressive scan activated: Small files ({small_count} arquivos)")
+            print(f"[Dedup Stage 5] Double Buffer: I/O + GPU em paralelo")
+            
+            # ===================================================================
+            # DOUBLE BUFFER: Producer-Consumer com fila limitada
+            # ===================================================================
+            # - Reader Thread: Lê arquivos do disco para memória
+            # - GPU Workers: Calculam hash dos dados já carregados
+            # - Fila de 128 itens: ~2-4GB RAM max (assumindo média de 20-30MB por arquivo)
+            # - Para ajustar: BUFFER_SIZE * tamanho médio dos arquivos = RAM usada
+            # ===================================================================
+            
+            BUFFER_SIZE = 128  # Itens na fila - seguro para sistemas com 16GB+ RAM
+            data_queue = queue.Queue(maxsize=BUFFER_SIZE)
+            reader_done = threading.Event()
+            
+            # Flatten all entries for sequential reading
+            all_entries = []
+            for group in small_files_groups:
+                for entry in group:
+                    all_entries.append((entry, group[0].size))
+            
+            def reader_thread():
+                """Lê arquivos do disco e coloca na fila (Producer)."""
+                for entry, size in all_entries:
                     try:
-                        # O hash é calculado na thread, liberando o GIL para I/O e OpenCL
-                        h = future.result()
+                        with open(entry.path_abs, "rb") as f:
+                            file_data = f.read()
+                        data_queue.put((entry, size, file_data))
+                    except Exception:
+                        data_queue.put((entry, size, None))  # Erro de leitura
+                reader_done.set()
+            
+            # Iniciar thread de leitura
+            reader = threading.Thread(target=reader_thread, name="FileReader", daemon=True)
+            reader.start()
+            
+            # Hash tracking por grupo
+            group_hashes = defaultdict(dict)  # group_id -> {hash: entry}
+            entry_to_group = {}
+            for gid, group in enumerate(small_files_groups):
+                for entry in group:
+                    entry_to_group[entry.path_abs] = gid
+            
+            # Processar com GPU (Consumer)
+            while True:
+                try:
+                    # Tentar pegar item da fila (com timeout para checar se reader terminou)
+                    item = data_queue.get(timeout=0.1)
+                    entry, size, file_data = item
+                    
+                    processed_count += 1
+                    
+                    # Feedback a cada 1000 arquivos
+                    if processed_count % 1000 == 0:
+                        pct = (processed_count / small_count) * 100
+                        qsize = data_queue.qsize()
+                        print(f"[Dedup Stage 5] Progresso: {processed_count}/{small_count} ({pct:.1f}%) - Duplicatas: {small_removed} | Buffer: {qsize}")
+                    
+                    gid = entry_to_group[entry.path_abs]
+                    hashes = group_hashes[gid]
+                    
+                    if file_data is None:
+                        # Erro de leitura - usar hash único
+                        hashes[hash(entry.path_abs)] = entry
+                        small_remaining += 1
+                    else:
+                        # Calcular hash via GPU usando dados já em memória
+                        h = self.compute_data_hash(file_data)
                         
-                        # 3. Lógica de deduplicação (sequencial, para thread safety)
                         if h in hashes:
-                            # Duplicata confirmada!
                             original = hashes[h]
                             entry.is_duplicate = True
                             entry.original_path_rel = original.path_rel
                             dupes_count += 1
                             bytes_saved += size
+                            small_removed += 1
                         else:
                             hashes[h] = entry
-                            
-                    except Exception as exc:
-                        print(f"[Deduplicator] Erro ao processar hash de {entry.path_abs}: {exc}")
-                        # Tratar como arquivo único em caso de erro
-                        hashes[hash(entry.path_abs)] = entry # Garante que não será duplicado por acidente
-                        
-        # O restante do código (linhas 340-343) permanece o mesmo
-        # ...
+                            small_remaining += 1
+                    
+                except queue.Empty:
+                    # Fila vazia - verificar se reader terminou
+                    if reader_done.is_set() and data_queue.empty():
+                        break
+            
+            # Aguardar reader terminar (safety)
+            reader.join(timeout=5)
+            
+            print(f"[Dedup Stage 5] Concluído: {small_removed} removidos. {small_remaining} restantes")
+        
+        # --- Stage 6+: Arquivos grandes - Progressive Scan ---
+        if large_files_groups:
+            stage_num = 6
+            current_offset = 0
+            pending_groups = large_files_groups[:]
+            
+            while pending_groups:
+                chunk_start = current_offset
+                chunk_end = current_offset + CHUNK_SIZE
+                end_mb = chunk_end // (1024 * 1024)
+                
+                next_pending = []
+                stage_removed = 0
+                stage_remaining = 0
+                
+                for group in pending_groups:
+                    size = group[0].size
+                    is_final_chunk = chunk_end >= size
+                    
+                    by_chunk_hash = defaultdict(list)
+                    
+                    for entry in group:
+                        if entry.is_duplicate:
+                            continue
+                        try:
+                            with open(entry.path_abs, "rb") as f:
+                                f.seek(chunk_start)
+                                chunk_data = f.read(CHUNK_SIZE)
+                            chunk_hash = self._hash_bytes(chunk_data)
+                            by_chunk_hash[chunk_hash].append(entry)
+                        except Exception:
+                            by_chunk_hash[hash(entry.path_abs)].append(entry)
+                    
+                    for subgroup in by_chunk_hash.values():
+                        if len(subgroup) == 1:
+                            stage_remaining += 1
+                        elif len(subgroup) > 1:
+                            if is_final_chunk:
+                                first = subgroup[0]
+                                for dup in subgroup[1:]:
+                                    dup.is_duplicate = True
+                                    dup.original_path_rel = first.path_rel
+                                    dupes_count += 1
+                                    bytes_saved += dup.size
+                                    stage_removed += 1
+                                stage_remaining += 1
+                            else:
+                                next_pending.append(subgroup)
+                                stage_remaining += len(subgroup)
+                
+                print(f"[Dedup Stage {stage_num}] Progressive {end_mb}MB: {stage_removed} removidos. {stage_remaining} restantes")
+                
+                pending_groups = next_pending
+                current_offset = chunk_end
+                stage_num += 1
+                
+                if stage_num > 200:
+                    print(f"[Dedup] AVISO: Limite de stages atingido.")
+                    break
         
         print(f"[Dedup Final] Encontradas {dupes_count} duplicatas reais.")
         print(f"[Dedup Final] Economia potencial: {bytes_saved / 1024 / 1024:.2f} MB")

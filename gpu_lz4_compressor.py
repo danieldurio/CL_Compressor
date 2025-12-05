@@ -680,7 +680,7 @@ class GPU_LZ4_Compressor:
                         
                         print(f"[GPU_LZ4] VRAM Total: {vram_total_mb:.0f}MB | Necessário: {vram_needed_mb:.0f}MB ({vram_usage_pct:.1f}%)")
                         
-                        if total_vram_needed > vram_total * 0.8:  # > 80% de VRAM
+                        if total_vram_needed > vram_total * 0.83:  # > 83% de VRAM
                             print(f"[GPU_LZ4] AVISO: Uso de VRAM muito alto ({vram_usage_pct:.1f}%)!")
                             print(f"[GPU_LZ4] Considere reduzir batch_size ou HASH_CANDIDATES")
                         
