@@ -213,15 +213,6 @@ Este sistema demonstra:
 
 A arquitetura é extensível, robusta e adequada a ambientes corporativos e pessoais.
 
----
-
-# **11. Próximos Passos**
-
-- Suporte a **multi-GPU paralela**  
-- Implementação de **segment stitching estilo GDeflate**  
-- Modo streaming para grandes arquivos  
-- Porta para CUDA pura para maior performance  
-- Integração com Zstd-long
 
 ---
 
