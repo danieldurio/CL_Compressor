@@ -320,94 +320,109 @@ class GPUFileDeduplicator:
         if count_s1 == 0:
             return entries
 
-        # --- ESTÁGIO 2: Primeiros 2 Bytes ---
-        candidates_s2 = []
-        removed_s2 = 0
+        # --- ESTÁGIO 2-4: Leitura Paralela de Bytes ---
+        # Otimização: Usar ThreadPoolExecutor para I/O paralelo
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
         
-        for group in candidates_s1:
-            by_first = defaultdict(list)
-            for entry in group:
-                try:
-                    with open(entry.path_abs, "rb") as f:
-                        first = f.read(2)
-                    by_first[first].append(entry)
-                except Exception:
-                    # Se der erro de leitura, ignora (trata como único)
-                    pass
-            
-            for subgroup in by_first.values():
-                if len(subgroup) > 1:
-                    candidates_s2.append(subgroup)
-                else:
-                    removed_s2 += 1
-                    
-        count_s2 = sum(len(g) for g in candidates_s2)
-        print(f"[Dedup Stage 2] First 2 Bytes: {removed_s2} removidos. {count_s2} restantes.")
-
-        # --- ESTÁGIO 3: Últimos 2 Bytes ---
-        candidates_s3 = []
-        removed_s3 = 0
+        NUM_IO_WORKERS = 4  # Valor fixo
         
-        for group in candidates_s2:
-            by_last = defaultdict(list)
-            size = group[0].size # Todos no grupo têm mesmo tamanho
-            
-            for entry in group:
-                try:
-                    with open(entry.path_abs, "rb") as f:
+        def read_file_bytes(entry: FileEntry, mode: str) -> tuple:
+            """
+            Lê bytes específicos de um arquivo.
+            mode: 'first', 'last', 'center'
+            Retorna: (entry, bytes_lidos) ou (entry, None) em caso de erro
+            """
+            try:
+                size = entry.size
+                with open(entry.path_abs, "rb") as f:
+                    if mode == 'first':
+                        data = f.read(2)
+                    elif mode == 'last':
                         if size >= 2:
-                            f.seek(-2, 2) # Ir para os últimos 2 bytes
-                            last = f.read(2)
+                            f.seek(-2, 2)
+                            data = f.read(2)
                         else:
-                            # Se tamanho < 2, lê o que tem (já verificado no estágio 2, mas ok)
-                            f.seek(0)
-                            last = f.read(2)
-                    by_last[last].append(entry)
-                except Exception:
-                    pass
-                    
-            for subgroup in by_last.values():
-                if len(subgroup) > 1:
-                    candidates_s3.append(subgroup)
-                else:
-                    removed_s3 += 1
-                    
-        count_s3 = sum(len(g) for g in candidates_s3)
-        print(f"[Dedup Stage 3] Last 2 Bytes:  {removed_s3} removidos. {count_s3} restantes.")
-
-        # --- ESTÁGIO 4: 8 Bytes do Centro ---
-        candidates_s4 = []
-        removed_s4 = 0
-        
-        for group in candidates_s3:
-            by_center = defaultdict(list)
-            size = group[0].size
-            
-            for entry in group:
-                try:
-                    with open(entry.path_abs, "rb") as f:
+                            data = f.read(2)
+                    elif mode == 'center':
                         if size >= 8:
-                            # Posição central e adjacentes - ler 8 bytes
                             center = size // 2
-                            # Começar 4 bytes antes do centro para pegar 8 bytes balanceados
                             f.seek(center - 4)
-                            center_bytes = f.read(8)
+                            data = f.read(8)
                         else:
-                            # Para arquivos muito pequenos, lê o que tem
-                            f.seek(0)
-                            center_bytes = f.read(size)
-                    by_center[center_bytes].append(entry)
-                except Exception:
-                    pass
+                            data = f.read(size)
+                    else:
+                        data = None
+                return (entry, data)
+            except Exception:
+                return (entry, None)
+        
+        def parallel_byte_filter(groups: list, mode: str, stage_name: str) -> list:
+            """
+            Filtra grupos lendo bytes em paralelo.
+            Retorna novos grupos onde arquivos têm bytes iguais.
+            """
+            # Flatten: todos os entries de todos os grupos
+            all_entries = []
+            entry_to_group_idx = {}
+            for gidx, group in enumerate(groups):
+                for entry in group:
+                    all_entries.append(entry)
+                    entry_to_group_idx[entry.path_abs] = gidx
+            
+            # Ler bytes em paralelo
+            entry_bytes = {}  # path_abs -> bytes
+            with ThreadPoolExecutor(max_workers=NUM_IO_WORKERS) as executor:
+                futures = {executor.submit(read_file_bytes, e, mode): e for e in all_entries}
+                
+                done_count = 0
+                total = len(futures)
+                for future in as_completed(futures):
+                    entry, data = future.result()
+                    if data is not None:
+                        entry_bytes[entry.path_abs] = data
+                    done_count += 1
                     
-            for subgroup in by_center.values():
-                if len(subgroup) > 1:
-                    candidates_s4.append(subgroup)
-                else:
-                    removed_s4 += 1
-                    
-        count_s4 = sum(len(g) for g in candidates_s4)
-        print(f"[Dedup Stage 4] Center 8 Bytes: {removed_s4} removidos.")
+                    # Feedback a cada 50k arquivos
+                    if done_count % 50000 == 0:
+                        pct = (done_count / total) * 100
+                        print(f"[Dedup {stage_name}] Lendo: {done_count}/{total} ({pct:.0f}%)")
+            
+            # Reagrupar por bytes dentro de cada grupo original
+            new_groups = []
+            removed = 0
+            
+            for gidx, group in enumerate(groups):
+                by_bytes = defaultdict(list)
+                for entry in group:
+                    data = entry_bytes.get(entry.path_abs)
+                    if data is not None:
+                        by_bytes[data].append(entry)
+                
+                for subgroup in by_bytes.values():
+                    if len(subgroup) > 1:
+                        new_groups.append(subgroup)
+                    else:
+                        removed += 1
+            
+            count = sum(len(g) for g in new_groups)
+            print(f"[Dedup {stage_name}] {removed} removidos. {count} restantes.")
+            return new_groups
+        
+        # Stage 2: Primeiros 2 bytes (paralelo)
+        candidates_s2 = parallel_byte_filter(candidates_s1, 'first', 'Stage 2')
+        
+        if not candidates_s2:
+            return entries
+        
+        # Stage 3: Últimos 2 bytes (paralelo)
+        candidates_s3 = parallel_byte_filter(candidates_s2, 'last', 'Stage 3')
+        
+        if not candidates_s3:
+            return entries
+        
+        # Stage 4: 8 bytes do centro (paralelo)
+        candidates_s4 = parallel_byte_filter(candidates_s3, 'center', 'Stage 4')
 
         # --- ESTÁGIO 5+: Progressive Scan ---
         # Stage 5: Arquivos pequenos (≤50MB) - hash completo
@@ -429,7 +444,7 @@ class GPUFileDeduplicator:
             else:
                 large_files_groups.append(group)
         
-        # --- Stage 5: Arquivos pequenos - Hash Completo via GPU (Double Buffer) ---
+        # --- Stage 5: Arquivos pequenos - Hash Completo via GPU (Multi-Reader) ---
         small_count = sum(len(g) for g in small_files_groups)
         small_removed = 0
         small_remaining = 0
@@ -439,95 +454,156 @@ class GPUFileDeduplicator:
             import queue
             import threading
             
-            # Output inicial ANTES de começar
-            print(f"[Dedup Stage 5] Progressive scan activated: Small files ({small_count} arquivos)")
-            print(f"[Dedup Stage 5] Double Buffer: I/O + GPU em paralelo")
-            
             # ===================================================================
-            # DOUBLE BUFFER: Producer-Consumer com fila limitada
+            # MULTI-READER: Pool de threads para leitura paralela
             # ===================================================================
-            # - Reader Thread: Lê arquivos do disco para memória
-            # - GPU Workers: Calculam hash dos dados já carregados
-            # - Fila de 128 itens: ~2-4GB RAM max (assumindo média de 20-30MB por arquivo)
-            # - Para ajustar: BUFFER_SIZE * tamanho médio dos arquivos = RAM usada
+            # - NUM_READERS threads leem arquivos em paralelo
+            # - Cada reader tem sua própria fatia da lista
+            # - Fila thread-safe unifica os resultados
+            # - GPU consome da fila (sempre cheia)
             # ===================================================================
             
-            BUFFER_SIZE = 128  # Itens na fila - seguro para sistemas com 16GB+ RAM
+            NUM_READERS = 4  # Número de threads de leitura
+            BUFFER_SIZE = 256  # Buffer maior para acomodar múltiplos readers
+            
             data_queue = queue.Queue(maxsize=BUFFER_SIZE)
-            reader_done = threading.Event()
+            readers_done = threading.Event()
+            active_readers = [NUM_READERS]  # Contador thread-safe
+            active_readers_lock = threading.Lock()
             
-            # Flatten all entries for sequential reading
+            print(f"[Dedup Stage 5] Multi-Reader activated: {NUM_READERS} readers | Buffer: {BUFFER_SIZE}")
+            print(f"[Dedup Stage 5] Processing {small_count} small files with GPU hashing")
+            
+            # Flatten all entries
             all_entries = []
             for group in small_files_groups:
                 for entry in group:
                     all_entries.append((entry, group[0].size))
             
-            def reader_thread():
-                """Lê arquivos do disco e coloca na fila (Producer)."""
-                for entry, size in all_entries:
-                    try:
-                        with open(entry.path_abs, "rb") as f:
-                            file_data = f.read()
-                        data_queue.put((entry, size, file_data))
-                    except Exception:
-                        data_queue.put((entry, size, None))  # Erro de leitura
-                reader_done.set()
+            # Dividir trabalho entre readers (chunks)
+            chunk_size = (len(all_entries) + NUM_READERS - 1) // NUM_READERS
             
-            # Iniciar thread de leitura
-            reader = threading.Thread(target=reader_thread, name="FileReader", daemon=True)
-            reader.start()
+            def reader_worker(reader_id: int, entries_slice: list):
+                """Thread que lê arquivos e coloca na fila."""
+                try:
+                    for entry, size in entries_slice:
+                        try:
+                            with open(entry.path_abs, "rb") as f:
+                                file_data = f.read()
+                            data_queue.put((entry, size, file_data))
+                        except Exception:
+                            data_queue.put((entry, size, None))
+                except Exception as reader_err:
+                    print(f"[Dedup Stage 5] Reader {reader_id} ERRO: {reader_err}")
+                finally:
+                    # SEMPRE decrementar contador, mesmo com erro
+                    with active_readers_lock:
+                        active_readers[0] -= 1
+                        if active_readers[0] == 0:
+                            readers_done.set()
+            
+            # Iniciar pool de readers
+            readers = []
+            for i in range(NUM_READERS):
+                start_idx = i * chunk_size
+                end_idx = min(start_idx + chunk_size, len(all_entries))
+                if start_idx >= len(all_entries):
+                    # Menos arquivos que readers - decrementar contador
+                    with active_readers_lock:
+                        active_readers[0] -= 1
+                        if active_readers[0] == 0:
+                            readers_done.set()
+                    continue
+                
+                entries_slice = all_entries[start_idx:end_idx]
+                t = threading.Thread(
+                    target=reader_worker, 
+                    args=(i, entries_slice),
+                    name=f"FileReader-{i}",
+                    daemon=True
+                )
+                t.start()
+                readers.append(t)
             
             # Hash tracking por grupo
-            group_hashes = defaultdict(dict)  # group_id -> {hash: entry}
+            group_hashes = defaultdict(dict)
             entry_to_group = {}
             for gid, group in enumerate(small_files_groups):
                 for entry in group:
                     entry_to_group[entry.path_abs] = gid
             
-            # Processar com GPU (Consumer)
-            while True:
-                try:
-                    # Tentar pegar item da fila (com timeout para checar se reader terminou)
-                    item = data_queue.get(timeout=0.1)
-                    entry, size, file_data = item
-                    
-                    processed_count += 1
-                    
-                    # Feedback a cada 1000 arquivos
-                    if processed_count % 1000 == 0:
-                        pct = (processed_count / small_count) * 100
-                        qsize = data_queue.qsize()
-                        print(f"[Dedup Stage 5] Progresso: {processed_count}/{small_count} ({pct:.1f}%) - Duplicatas: {small_removed} | Buffer: {qsize}")
-                    
-                    gid = entry_to_group[entry.path_abs]
-                    hashes = group_hashes[gid]
-                    
-                    if file_data is None:
-                        # Erro de leitura - usar hash único
-                        hashes[hash(entry.path_abs)] = entry
-                        small_remaining += 1
-                    else:
-                        # Calcular hash via GPU usando dados já em memória
-                        h = self.compute_data_hash(file_data)
-                        
-                        if h in hashes:
-                            original = hashes[h]
-                            entry.is_duplicate = True
-                            entry.original_path_rel = original.path_rel
-                            dupes_count += 1
-                            bytes_saved += size
-                            small_removed += 1
-                        else:
-                            hashes[h] = entry
-                            small_remaining += 1
-                    
-                except queue.Empty:
-                    # Fila vazia - verificar se reader terminou
-                    if reader_done.is_set() and data_queue.empty():
-                        break
+            # Contador de erros para evitar spam de logs
+            error_count = 0
+            MAX_ERRORS_LOG = 10
             
-            # Aguardar reader terminar (safety)
-            reader.join(timeout=5)
+            # Processar com GPU (Consumer) - loop otimizado com error handling
+            try:
+                while True:
+                    try:
+                        item = data_queue.get(timeout=0.1)
+                        entry, size, file_data = item
+                        
+                        processed_count += 1
+                        
+                        # Feedback a cada 1000 arquivos
+                        if processed_count % 1000 == 0:
+                            pct = (processed_count / small_count) * 100
+                            qsize = data_queue.qsize()
+                            print(f"[Dedup Stage 5] Progresso: {processed_count}/{small_count} ({pct:.1f}%) - Duplicatas: {small_removed} | Buffer: {qsize}")
+                        
+                        # Verificar se entry está no mapa (safety check)
+                        if entry.path_abs not in entry_to_group:
+                            small_remaining += 1
+                            continue
+                        
+                        gid = entry_to_group[entry.path_abs]
+                        hashes = group_hashes[gid]
+                        
+                        if file_data is None:
+                            hashes[hash(entry.path_abs)] = entry
+                            small_remaining += 1
+                        else:
+                            try:
+                                h = self.compute_data_hash(file_data)
+                            except Exception as hash_err:
+                                error_count += 1
+                                if error_count <= MAX_ERRORS_LOG:
+                                    print(f"[Dedup Stage 5] Erro hash: {hash_err}")
+                                # Fallback: usar hash Python nativo
+                                h = hash(file_data[:1024]) if len(file_data) > 0 else hash(entry.path_abs)
+                            
+                            if h in hashes:
+                                original = hashes[h]
+                                entry.is_duplicate = True
+                                entry.original_path_rel = original.path_rel
+                                dupes_count += 1
+                                bytes_saved += size
+                                small_removed += 1
+                            else:
+                                hashes[h] = entry
+                                small_remaining += 1
+                        
+                    except queue.Empty:
+                        if readers_done.is_set() and data_queue.empty():
+                            break
+                    except Exception as item_err:
+                        error_count += 1
+                        if error_count <= MAX_ERRORS_LOG:
+                            print(f"[Dedup Stage 5] Erro processando item: {item_err}")
+                        # Continuar processando outros itens
+                        continue
+                        
+            except Exception as loop_err:
+                import traceback
+                print(f"[Dedup Stage 5] ERRO CRÍTICO no loop: {loop_err}")
+                traceback.print_exc()
+            
+            # Aguardar todos os readers terminarem
+            for t in readers:
+                t.join(timeout=2)
+            
+            if error_count > 0:
+                print(f"[Dedup Stage 5] Total de erros durante processamento: {error_count}")
             
             print(f"[Dedup Stage 5] Concluído: {small_removed} removidos. {small_remaining} restantes")
         
