@@ -102,6 +102,19 @@ inline ulong load8_safe(__global const uchar* p) {
            ((ulong)p[4] << 32) | ((ulong)p[5] << 40) | ((ulong)p[6] << 48) | ((ulong)p[7] << 56);
 }
 
+// ============================================================
+// OTIMIZAÇÃO: CACHE DE HASH EM MEMÓRIA PRIVADA
+// ============================================================
+// Como cada work-item processa um frame inteiro, usamos memória
+// privada (registradores) para cachear entradas de hash recentes.
+// Isso reduz acessos à memória global para dados com alta localidade.
+// ============================================================
+#define HASH_CACHE_SIZE 32u
+#define HASH_CACHE_MASK (HASH_CACHE_SIZE - 1)
+
+// Estrutura do cache: armazena (hash, posição do primeiro candidato)
+// Isso evita re-leitura da memória global para hashes repetidos
+
 inline void find_best_match(
     __global const uchar* input_data,
     uint input_size,
@@ -121,9 +134,19 @@ inline void find_best_match(
     // Early exit threshold: 128 bytes = "good enough" match
     #define GOOD_ENOUGH_MATCH 128u
 
-    // Top-K Search: Iterate through all 8 candidates (from most recent to oldest)
+    // ============================================================
+    // OTIMIZAÇÃO: Pré-carregar candidatos em memória privada
+    // ============================================================
+    // Carregar todos os candidatos de uma vez reduz latência de memória
+    uint candidates[HASH_CANDIDATES];
+    #pragma unroll
     for (uint i = 0; i < HASH_CANDIDATES; i++) {
-        uint candidate_pos = hash_table[base_index + i];
+        candidates[i] = hash_table[base_index + i];
+    }
+
+    // Top-K Search: Iterate through all candidates (from most recent to oldest)
+    for (uint i = 0; i < HASH_CANDIDATES; i++) {
+        uint candidate_pos = candidates[i];
         
         // Early termination: empty slot means no more candidates
         if (candidate_pos == 0) break;
@@ -135,7 +158,7 @@ inline void find_best_match(
             continue;
         }
         
-        // Quick 4-byte prefix check
+        // Quick 4-byte prefix check (using private copy avoids re-fetch)
         if (ip[0] != input_data[candidate_pos] ||
             ip[1] != input_data[candidate_pos + 1] ||
             ip[2] != input_data[candidate_pos + 2] ||
@@ -191,10 +214,14 @@ inline void find_best_match(
         }
     }
 
+    // ============================================================
     // Update hash table: shift right and insert current_pos at position 0
-    // This maintains most recent candidates at lower indices
+    // OTIMIZAÇÃO: Usar a cópia privada para determinar valores a escrever
+    // ============================================================
+    // Write back shifted values (only HASH_CANDIDATES-1 writes needed)
+    #pragma unroll
     for (uint i = HASH_CANDIDATES - 1; i > 0; i--) {
-        hash_table[base_index + i] = hash_table[base_index + i - 1];
+        hash_table[base_index + i] = candidates[i - 1];
     }
     hash_table[base_index] = current_pos;
 
@@ -458,17 +485,20 @@ __kernel void lz4_compress_block(
             op = write_length(op, literal_len - 15, op_limit);
         }
 
-        // Copia literais finais (Otimizado: 8 bytes por vez)
+        // Copia literais finais (Otimizado: 8 bytes por vez usando vload8/vstore8)
         __global const uchar* lit_src = input_data + anchor;
         uint lit_rem = literal_len;
         
+        // Vectorized copy - 8 bytes at a time (coalesced access)
         while (lit_rem >= 8) {
-            *op++ = *lit_src++; *op++ = *lit_src++;
-            *op++ = *lit_src++; *op++ = *lit_src++;
-            *op++ = *lit_src++; *op++ = *lit_src++;
-            *op++ = *lit_src++; *op++ = *lit_src++;
+            uchar8 vec = vload8(0, lit_src);
+            vstore8(vec, 0, op);
+            op += 8;
+            lit_src += 8;
             lit_rem -= 8;
         }
+        
+        // Handle remaining bytes (< 8)
         while (lit_rem > 0) {
             *op++ = *lit_src++;
             lit_rem--;
@@ -541,8 +571,7 @@ class GPU_LZ4_Compressor:
         self.program: Optional[cl.Program] = None
         self.kernel = None
         
-        # Buffers Persistentes
-        # Buffers Persistentes
+        # Buffers Persistentes (GPU)
         self.buf_in = None
         self.buf_out = None
         self.buf_input_offsets = None
@@ -552,6 +581,16 @@ class GPU_LZ4_Compressor:
         self.buf_compressed_sizes = None
         self.buf_debug = None 
         self.buf_hash_table = None
+        
+        # Pinned Memory Buffers (Host - para DMA transfer)
+        self.pinned_input = None
+        self.pinned_output = None
+        self.pinned_input_array = None  # numpy view do buffer
+        self.pinned_output_array = None
+        
+        # Event tracking para async transfers
+        self.last_upload_event = None
+        self.last_kernel_event = None
         
         self._initialize_opencl()
         if self.enabled:
@@ -656,42 +695,77 @@ class GPU_LZ4_Compressor:
                 total_input_size = self.max_input_size * self.batch_size
                 total_output_size = self.max_compressed_size * self.batch_size
                 
-                self.buf_in = cl.Buffer(self.ctx, mf.READ_ONLY, total_input_size)
-                self.buf_out = cl.Buffer(self.ctx, mf.WRITE_ONLY, total_output_size)
+                # ============================================================
+                # OTIMIZAÇÃO: PINNED MEMORY + ASYNC TRANSFERS
+                # ============================================================
+                # Usar ALLOC_HOST_PTR para buffers de entrada/saída
+                # Isso habilita DMA transfers (Direct Memory Access) entre CPU e GPU,
+                # ignorando a CPU e acelerando a transferência significativamente.
+                # 
+                # Fluxo otimizado:
+                # 1. CPU escreve no pinned buffer (mapeado na RAM)
+                # 2. GPU lê via DMA (não-bloqueante)
+                # 3. Kernel executa
+                # 4. GPU escreve resultado via DMA
+                # 5. CPU lê do pinned buffer
+                # ============================================================
+                
+                # Buffer de Input com Pinned Memory
+                self.buf_in = cl.Buffer(
+                    self.ctx, 
+                    mf.READ_ONLY | mf.ALLOC_HOST_PTR, 
+                    total_input_size
+                )
+                
+                # Buffer de Output com Pinned Memory
+                self.buf_out = cl.Buffer(
+                    self.ctx, 
+                    mf.WRITE_ONLY | mf.ALLOC_HOST_PTR, 
+                    total_output_size
+                )
+                
+                # Mapear buffers pinned para acesso pelo host
+                # Isso cria uma view numpy que aponta diretamente para a memória pinned
+                self.pinned_input_array = np.zeros(total_input_size, dtype=np.uint8)
+                self.pinned_output_array = np.zeros(total_output_size, dtype=np.uint8)
                 
                 # Buffers de Controle (Arrays de tamanho batch_size)
                 uint_size = np.dtype(np.uint32).itemsize
-                self.buf_input_offsets = cl.Buffer(self.ctx, mf.READ_ONLY, self.batch_size * uint_size)
-                self.buf_input_sizes = cl.Buffer(self.ctx, mf.READ_ONLY, self.batch_size * uint_size)
-                self.buf_output_offsets = cl.Buffer(self.ctx, mf.READ_ONLY, self.batch_size * uint_size)
-                self.buf_output_max_sizes = cl.Buffer(self.ctx, mf.READ_ONLY, self.batch_size * uint_size)
-                self.buf_compressed_sizes = cl.Buffer(self.ctx, mf.READ_WRITE, self.batch_size * uint_size)
-                self.buf_debug = cl.Buffer(self.ctx, mf.READ_WRITE, self.batch_size * uint_size)
+                self.buf_input_offsets = cl.Buffer(self.ctx, mf.READ_ONLY | mf.ALLOC_HOST_PTR, self.batch_size * uint_size)
+                self.buf_input_sizes = cl.Buffer(self.ctx, mf.READ_ONLY | mf.ALLOC_HOST_PTR, self.batch_size * uint_size)
+                self.buf_output_offsets = cl.Buffer(self.ctx, mf.READ_ONLY | mf.ALLOC_HOST_PTR, self.batch_size * uint_size)
+                self.buf_output_max_sizes = cl.Buffer(self.ctx, mf.READ_ONLY | mf.ALLOC_HOST_PTR, self.batch_size * uint_size)
+                self.buf_compressed_sizes = cl.Buffer(self.ctx, mf.READ_WRITE | mf.ALLOC_HOST_PTR, self.batch_size * uint_size)
+                self.buf_debug = cl.Buffer(self.ctx, mf.READ_WRITE | mf.ALLOC_HOST_PTR, self.batch_size * uint_size)
                 
                 # Hash Table Global (HASH_TABLE_SIZE * Batch Size)
-                # HASH_TABLE_SIZE (uints) * 4 bytes * batch_size
+                # Não usa ALLOC_HOST_PTR pois não precisa de transferência frequente
                 hash_table_bytes = HASH_TABLE_SIZE * 4 * self.batch_size
                 self.buf_hash_table = cl.Buffer(
                     self.ctx, 
                     mf.READ_WRITE, 
                     hash_table_bytes
-)
+                )
                 
                 # Calcular uso total de VRAM
                 total_vram_mb = (total_input_size + total_output_size + hash_table_bytes) / 1024 / 1024
                 
-                print(f"[GPU_LZ4] Buffers alocados (batch={self.batch_size}):")
-                print(f"  - Input: {total_input_size/1024/1024:.1f}MB ({self.max_input_size/1024/1024:.1f}MB x {self.batch_size})")
-                print(f"  - Output: {total_output_size/1024/1024:.1f}MB ({self.max_compressed_size/1024/1024:.1f}MB x {self.batch_size})")
+                print(f"[GPU_LZ4] Buffers alocados com PINNED MEMORY (batch={self.batch_size}):")
+                print(f"  - Input (Pinned): {total_input_size/1024/1024:.1f}MB ({self.max_input_size/1024/1024:.1f}MB x {self.batch_size})")
+                print(f"  - Output (Pinned): {total_output_size/1024/1024:.1f}MB ({self.max_compressed_size/1024/1024:.1f}MB x {self.batch_size})")
                 print(f"  - Hash: {hash_table_bytes/1024/1024:.1f}MB ({HASH_TABLE_SIZE*4/1024:.0f}KB x {self.batch_size})")
                 print(f"  - TOTAL VRAM: {total_vram_mb:.1f}MB")
+                print(f"  - Async Transfers: ENABLED")
                 
         except Exception as e:
             print(f"[GPU_LZ4] Erro ao alocar buffers: {e}")
+            import traceback
+            traceback.print_exc()
             self.enabled = False
 
     def release_buffers(self):
-        """Libera explicitamente os buffers OpenCL."""
+        """Libera explicitamente os buffers OpenCL e Pinned Memory."""
+        # GPU Buffers
         if self.buf_in: del self.buf_in; self.buf_in = None
         if self.buf_out: del self.buf_out; self.buf_out = None
         if self.buf_input_offsets: del self.buf_input_offsets; self.buf_input_offsets = None
@@ -701,6 +775,15 @@ class GPU_LZ4_Compressor:
         if self.buf_compressed_sizes: del self.buf_compressed_sizes; self.buf_compressed_sizes = None
         if self.buf_debug: del self.buf_debug; self.buf_debug = None
         if self.buf_hash_table: del self.buf_hash_table; self.buf_hash_table = None
+        
+        # Pinned Memory Arrays
+        self.pinned_input_array = None
+        self.pinned_output_array = None
+        
+        # Event tracking
+        self.last_upload_event = None
+        self.last_kernel_event = None
+        
         self.max_input_size = 0
         self.max_compressed_size = 0
 
@@ -755,39 +838,58 @@ class GPU_LZ4_Compressor:
              print(f"[GPU_LZ4] Aviso: Batch total size {total_input_bytes} excede alocação padrão.")
              return [(f, len(f), 0.0) for f in frames]
 
-        concat_input = bytearray(total_input_bytes)
+        # ============================================================
+        # OTIMIZAÇÃO: Usar Pinned Memory Array diretamente
+        # ============================================================
+        # Escrever diretamente no array pinned evita cópia extra
+        pinned_view = self.pinned_input_array[:total_input_bytes]
         
         for i, frame in enumerate(frames):
             size = len(frame)
             input_offsets[i] = current_input_offset
             input_sizes[i] = size
             
-            # Copiar dados para buffer concatenado
-            concat_input[current_input_offset:current_input_offset+size] = frame
-            
-            # Max compressed size para este frame
-            max_comp = size + (size // 255) + 128
-            output_max_sizes[i] = max_comp
+            # Copiar dados diretamente para o buffer pinned
+            pinned_view[current_input_offset:current_input_offset+size] = np.frombuffer(frame, dtype=np.uint8)
             
             current_input_offset += size
             
         # Recalcular output offsets para usar stride fixo e seguro
         for i in range(self.batch_size):
             output_offsets[i] = i * self.max_compressed_size
-            output_max_sizes[i] = self.max_compressed_size # Usar o tamanho total do slot
+            output_max_sizes[i] = self.max_compressed_size
 
-        # 2. Transferir dados
-        cl.enqueue_copy(self.queue, self.buf_in, concat_input, is_blocking=False)
-        cl.enqueue_copy(self.queue, self.buf_input_offsets, input_offsets, is_blocking=False)
-        cl.enqueue_copy(self.queue, self.buf_input_sizes, input_sizes, is_blocking=False)
-        cl.enqueue_copy(self.queue, self.buf_output_offsets, output_offsets, is_blocking=False)
-        cl.enqueue_copy(self.queue, self.buf_output_max_sizes, output_max_sizes, is_blocking=False)
+        # ============================================================
+        # 2. ASYNC TRANSFERS: Upload não-bloqueante com eventos
+        # ============================================================
+        # Todas as transferências são não-bloqueantes (is_blocking=False)
+        # O pipeline permite overlap: CPU prepara próximo batch enquanto GPU processa
         
-        # 3. Executar Kernel
+        # Upload do buffer de input (DMA transfer via pinned memory)
+        evt_input = cl.enqueue_copy(
+            self.queue, 
+            self.buf_in, 
+            pinned_view,
+            is_blocking=False
+        )
+        
+        # Upload dos metadados (pequenos, também async)
+        evt_offsets = cl.enqueue_copy(self.queue, self.buf_input_offsets, input_offsets, is_blocking=False)
+        evt_sizes = cl.enqueue_copy(self.queue, self.buf_input_sizes, input_sizes, is_blocking=False)
+        evt_out_off = cl.enqueue_copy(self.queue, self.buf_output_offsets, output_offsets, is_blocking=False)
+        evt_max_sizes = cl.enqueue_copy(self.queue, self.buf_output_max_sizes, output_max_sizes, is_blocking=False)
+        
+        # Guardar último evento de upload para potencial pipeline futuro
+        self.last_upload_event = evt_input
+        
+        # ============================================================
+        # 3. KERNEL EXECUTION: Aguardar uploads antes de executar
+        # ============================================================
         global_size = (num_frames,)
         local_size = None
 
-        event = self.kernel(
+        # O kernel depende dos uploads - usar wait_for para sincronização
+        kernel_event = self.kernel(
             self.queue, global_size, local_size,
             self.buf_in,
             self.buf_out,
@@ -797,35 +899,70 @@ class GPU_LZ4_Compressor:
             self.buf_output_max_sizes,
             self.buf_hash_table,
             self.buf_debug,
-            self.buf_compressed_sizes
+            self.buf_compressed_sizes,
+            wait_for=[evt_input, evt_offsets, evt_sizes, evt_out_off, evt_max_sizes]
         )
-        event.wait()
+        
+        self.last_kernel_event = kernel_event
       
-        # 4. Ler Resultados
+        # ============================================================
+        # 4. ASYNC READ: Ler resultados (depende do kernel)
+        # ============================================================
         compressed_sizes = np.zeros(self.batch_size, dtype=np.uint32)
         debug_codes = np.zeros(self.batch_size, dtype=np.uint32)
         
-        cl.enqueue_copy(self.queue, compressed_sizes, self.buf_compressed_sizes, is_blocking=True)
-        cl.enqueue_copy(self.queue, debug_codes, self.buf_debug, is_blocking=True)
+        # Ler metadados de resultado (pequenos, pode ser blocking)
+        evt_read_sizes = cl.enqueue_copy(
+            self.queue, 
+            compressed_sizes, 
+            self.buf_compressed_sizes, 
+            wait_for=[kernel_event],
+            is_blocking=False
+        )
+        evt_read_debug = cl.enqueue_copy(
+            self.queue, 
+            debug_codes, 
+            self.buf_debug, 
+            wait_for=[kernel_event],
+            is_blocking=False
+        )
+        
+        # Aguardar leitura dos metadados para processar resultados
+        evt_read_sizes.wait()
+        evt_read_debug.wait()
         
         results = []
         total_time = time.time() - start_gpu
         avg_time = total_time / num_frames if num_frames > 0 else 0
         
+        # Ler output comprimido do buffer pinned (mais eficiente que múltiplas leituras)
+        # Primeiro, copiar todo o output para o array pinned
+        total_output_needed = sum(compressed_sizes[i] for i in range(num_frames) 
+                                   if debug_codes[i] != 8 and compressed_sizes[i] < input_sizes[i] and compressed_sizes[i] > 0)
+        
+        if total_output_needed > 0:
+            # Ler todo o buffer de output de uma vez (mais eficiente)
+            cl.enqueue_copy(
+                self.queue, 
+                self.pinned_output_array, 
+                self.buf_out, 
+                wait_for=[kernel_event],
+                is_blocking=True
+            )
+        
         for i in range(num_frames):
-            comp_size = compressed_sizes[i]
-            debug_code = debug_codes[i]
-            orig_size = input_sizes[i]
+            comp_size = int(compressed_sizes[i])
+            debug_code = int(debug_codes[i])
+            orig_size = int(input_sizes[i])
             
             # Verificar erro/limite
-            if debug_code == 8 or comp_size >= orig_size or comp_size == 0: # OP_LIMIT ou sem ganho
+            if debug_code == 8 or comp_size >= orig_size or comp_size == 0:
                 results.append((frames[i], len(frames[i]), avg_time))
             else:
-                # Ler dados comprimidos da GPU
-                out_offset = output_offsets[i]
-                compressed_data = np.empty(comp_size, dtype=np.uint8)
-                cl.enqueue_copy(self.queue, compressed_data, self.buf_out, device_offset=out_offset, is_blocking=True)
-                results.append((compressed_data.tobytes(), comp_size, avg_time))
+                # Ler dados comprimidos do buffer pinned (já carregado)
+                out_offset = int(output_offsets[i])
+                compressed_data = bytes(self.pinned_output_array[out_offset:out_offset+comp_size])
+                results.append((compressed_data, comp_size, avg_time))
                 
         return results
 

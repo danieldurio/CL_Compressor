@@ -26,6 +26,9 @@ from deduplicator import GPUFileDeduplicator
 OPENCL_AVAILABLE = False
 GPU_LZ4_Compressor = None
 
+# Flag global para forçar modo CPU (via --cpu)
+FORCE_CPU_MODE = False
+
 try:
     import pyopencl as cl
     from gpu_lz4_compressor import GPU_LZ4_Compressor
@@ -52,7 +55,7 @@ from compressor_fallback import CPU_LZ4_Compressor
 #8-12 GB	32-64 frames
 #12+ GB	64-128 frames
 
-BATCH_SIZE_OVERRIDE = None
+BATCH_SIZE_OVERRIDE = 75
 # ============================================================
 
 # ============================================================
@@ -60,7 +63,7 @@ BATCH_SIZE_OVERRIDE = None
 # ============================================================
 # Número de batches em buffer para leitura antecipada (read-ahead)
 # Maior valor = mais RAM, menos espera por I/O de leitura
-READ_BUFFER_BATCHES = 2
+READ_BUFFER_BATCHES = 1
 
 # Número de batches em buffer para escrita atrasada (write-behind)  
 # Maior valor = mais RAM, menos espera por I/O de escrita
@@ -86,12 +89,18 @@ def compress_directory_lz4(
     USE_CPU_FALLBACK = False
     BATCH_SIZE = BATCH_SIZE_OVERRIDE if BATCH_SIZE_OVERRIDE is not None else 24  # Default
     
-    if not OPENCL_AVAILABLE:
+    # Verificar se modo CPU foi forçado via --cpu
+    if FORCE_CPU_MODE:
+        USE_CPU_FALLBACK = True
+        import multiprocessing
+        BATCH_SIZE = multiprocessing.cpu_count() * 2
+        print(f"[Compressor] 🖥️ MODO CPU FORÇADO (--cpu): Batch Size = {BATCH_SIZE} frames ({multiprocessing.cpu_count()} CPUs)")
+    elif not OPENCL_AVAILABLE:
         # Sem OpenCL - usar CPU fallback
         USE_CPU_FALLBACK = True
         import multiprocessing
         BATCH_SIZE = multiprocessing.cpu_count() * 2  # Batch = 2x CPUs para melhor throughput
-        print(f"[Compressor] Modo CPU: Batch Size = {BATCH_SIZE} frames ({multiprocessing.cpu_count()} CPUs)")
+        print(f"[Compressor] Modo CPU (OpenCL indisponível): Batch Size = {BATCH_SIZE} frames ({multiprocessing.cpu_count()} CPUs)")
     elif BATCH_SIZE_OVERRIDE is not None:
         BATCH_SIZE = BATCH_SIZE_OVERRIDE
         print(f"[Compressor] Batch Size FIXO (definido pelo usuário): {BATCH_SIZE} frames")
@@ -542,13 +551,20 @@ def compress_directory_lz4(
     return all_frames
 
 def main() -> int:
+    global FORCE_CPU_MODE
+    
     parser = argparse.ArgumentParser(description="Compressor LZ4 GPU + Deduplicação")
     parser.add_argument("source", help="Pasta de origem")
     parser.add_argument("-o", "--output", default="archive_lz4.gpu", help="Base de saída")
     parser.add_argument("--frame-size-mb", type=int, default=16, help="Tamanho do frame (MB) - recomendado: 16-32 para janela de 16MB")
     parser.add_argument("--volume-size-mb", type=int, default=98, help="Tamanho do volume (MB)")
+    parser.add_argument("--cpu", action="store_true", help="Forçar modo CPU (ignorar GPU/OpenCL)")
     
     args = parser.parse_args()
+    
+    # Aplicar flag --cpu
+    if args.cpu:
+        FORCE_CPU_MODE = True
     
     source_dir = Path(args.source).resolve()
     if not source_dir.is_dir():
@@ -560,7 +576,10 @@ def main() -> int:
     max_volume_size = args.volume_size_mb * 1024 * 1024
     
     print("="*70)
-    print("COMPRESSOR LZ4 GPU + DEDUP")
+    if FORCE_CPU_MODE:
+        print("COMPRESSOR LZ4 CPU (--cpu)")
+    else:
+        print("COMPRESSOR LZ4 GPU + DEDUP")
     print("="*70)
     print(f"Fonte: {source_dir}")
     print(f"Saída: {output_base}")
@@ -575,8 +594,11 @@ def main() -> int:
     total_size_orig = estimate_total_size(entries)
     print(f"Arquivos: {len(entries)} ({total_size_orig} bytes)")
     
-    # 2. Deduplicação GPU
-    print("\n[Fase 1] Deduplicação GPU...")
+    # 2. Deduplicação (GPU ou CPU dependendo do modo)
+    if FORCE_CPU_MODE:
+        print("\n[Fase 1] Deduplicação CPU...")
+    else:
+        print("\n[Fase 1] Deduplicação GPU...")
     deduplicator = GPUFileDeduplicator()
     entries = deduplicator.find_duplicates(entries)
     
@@ -589,7 +611,10 @@ def main() -> int:
         print(f"Economia Dedup: {dedup_saved / 1024 / 1024:.2f} MB ({(dedup_saved/total_size_orig)*100:.1f}%)")
     
     # 3. Compressão
-    print("\n[Fase 2] Compressão LZ4 GPU...")
+    if FORCE_CPU_MODE:
+        print("\n[Fase 2] Compressão LZ4 CPU...")
+    else:
+        print("\n[Fase 2] Compressão LZ4 GPU...")
     print(f"[Compressor] Parâmetros: frame_size={args.frame_size_mb}MB, max_volume={args.volume_size_mb}MB")
     
     index_params = {
@@ -598,7 +623,7 @@ def main() -> int:
         "source_root": str(source_dir),
         "deduplication": True,
         "dedup_saved_bytes": dedup_saved,
-        "compressor": "lz4_gpu"
+        "compressor": "lz4_cpu" if FORCE_CPU_MODE else "lz4_gpu"
     }
     
     compress_directory_lz4(

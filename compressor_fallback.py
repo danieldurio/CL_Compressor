@@ -69,7 +69,9 @@ def _hash4_jit(data: np.ndarray, pos: int, data_len: int) -> int:
             (np.uint32(data[pos + 1]) << 8) | \
             (np.uint32(data[pos + 2]) << 16) | \
             (np.uint32(data[pos + 3]) << 24)
-    return int((np.uint32(value * np.uint32(0x9E3779B1))) >> (32 - 20))
+    # Explicit cast to int64 to avoid float64 inference
+    result = np.uint32(value * np.uint32(0x9E3779B1)) >> np.uint32(32 - 20)
+    return np.int64(result)
 
 
 @jit(nopython=True, cache=True)
@@ -88,9 +90,12 @@ def _find_best_match_jit(
     best_pos = 0
     best_len = 0
     
+    # Ensure hash_value is int64 for indexing
+    hv = np.int64(hash_value)
+    
     # Iterar sobre candidatos
     for i in range(7):  # HASH_CANDIDATES = 7
-        candidate_pos = hash_table[hash_value, i]
+        candidate_pos = hash_table[hv, i]
         
         if candidate_pos == 0:
             break
@@ -125,8 +130,8 @@ def _find_best_match_jit(
     
     # Update hash table: shift right and insert current_pos at position 0
     for i in range(6, 0, -1):  # HASH_CANDIDATES - 1
-        hash_table[hash_value, i] = hash_table[hash_value, i - 1]
-    hash_table[hash_value, 0] = current_pos
+        hash_table[hv, i] = hash_table[hv, i - 1]
+    hash_table[hv, 0] = current_pos
     
     return best_pos, best_len
 
@@ -254,7 +259,7 @@ def _compress_core_jit(
         # Update hash para ip-2
         if sel_match_len > 4 and ip < last_literal_pos:
             pos_hash = ip - 2
-            h2 = _hash4_jit(data, pos_hash, input_size)
+            h2 = np.int64(_hash4_jit(data, pos_hash, input_size))
             for k in range(6, 0, -1):
                 hash_table[h2, k] = hash_table[h2, k - 1]
             hash_table[h2, 0] = pos_hash

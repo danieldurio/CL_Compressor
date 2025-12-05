@@ -618,16 +618,25 @@ def main() -> int:
                         excluded_indices = prompt_gpu_selection()
                     
                     # Initialize one decompressor per enabled GPU
+                    # Get frame_size from params for optimal buffer allocation
+                    frame_size = params.get("frame_size", 16 * 1024 * 1024)
+                    
                     for idx, gpu_global_idx in enumerate(gpu_indices_map):
                         if gpu_global_idx in excluded_indices:
                             continue  # Skip excluded GPUs
                         
                         try:
-                            decompressor = GPU_LZ4_Decompressor(device_index=gpu_global_idx)
+                            # Pass batch size and frame size for Pinned Memory allocation
+                            decompressor = GPU_LZ4_Decompressor(
+                                device_index=gpu_global_idx,
+                                max_batch_size=GPU_BATCH_SIZE,
+                                max_frame_size=frame_size
+                            )
                             if decompressor.enabled:
                                 gpu_decompressors.append(decompressor)
                         except Exception as e:
                             print(f"[GPU_LZ4] Failed to initialize GPU {gpu_global_idx}: {e}")
+
             
             if not gpu_decompressors:
                 print("[GPU_LZ4] No GPUs available, using CPU only")

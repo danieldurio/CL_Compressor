@@ -40,22 +40,86 @@ class FileEntry:
 def scan_directory(root: Path) -> List[FileEntry]:
     """
     Varre recursivamente a pasta `root` e monta a lista de FileEntry.
+    
+    Arquivos/pastas inacessíveis são ignorados com aviso no console.
+    Motivos de skip: permissão negada, arquivo em uso, caminho inválido, etc.
     """
     entries: List[FileEntry] = []
     root = root.resolve()
+    
+    # Estatísticas de erros
+    skipped_count = 0
+    skipped_reasons = {}
 
-    for path_abs in root.rglob("*"):
-        if not path_abs.is_file():
-            continue
+    try:
+        all_paths = list(root.rglob("*"))
+    except PermissionError as e:
+        print(f"[SCAN] ⚠️ SKIP: Sem permissão para acessar '{root}': {e}")
+        return entries
+    except OSError as e:
+        print(f"[SCAN] ⚠️ SKIP: Erro ao acessar '{root}': {e}")
+        return entries
 
+    for path_abs in all_paths:
         try:
+            # Verificar se é arquivo (pode falhar se path inacessível)
+            if not path_abs.is_file():
+                continue
+
+            # Tentar obter tamanho (pode falhar em arquivos em uso/bloqueados)
             size = path_abs.stat().st_size
-        except OSError:
+            
+            # Caminho relativo (sempre com /) em relação à raiz
+            path_rel = str(path_abs.relative_to(root)).replace("\\", "/")
+            entries.append(FileEntry(path_abs=path_abs, path_rel=path_rel, size=size))
+            
+        except PermissionError:
+            skipped_count += 1
+            reason = "Permissão negada"
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            print(f"[SCAN] ⚠️ SKIP: {path_abs.name} - {reason}")
+            continue
+            
+        except FileNotFoundError:
+            skipped_count += 1
+            reason = "Arquivo não encontrado/movido"
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            print(f"[SCAN] ⚠️ SKIP: {path_abs.name} - {reason}")
+            continue
+            
+        except OSError as e:
+            skipped_count += 1
+            # Detectar motivos específicos do Windows
+            error_code = getattr(e, 'winerror', None) or e.errno
+            
+            if error_code == 32:  # ERROR_SHARING_VIOLATION
+                reason = "Arquivo em uso por outro processo"
+            elif error_code == 5:  # ERROR_ACCESS_DENIED
+                reason = "Acesso negado pelo sistema"
+            elif error_code == 123:  # ERROR_INVALID_NAME
+                reason = "Nome de arquivo inválido"
+            elif error_code == 1920:  # ERROR_CANT_ACCESS_FILE
+                reason = "Arquivo não pode ser acessado"
+            else:
+                reason = f"Erro de I/O ({error_code}): {e}"
+                
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            print(f"[SCAN] ⚠️ SKIP: {path_abs.name} - {reason}")
+            continue
+            
+        except Exception as e:
+            skipped_count += 1
+            reason = f"Erro inesperado: {type(e).__name__}"
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            print(f"[SCAN] ⚠️ SKIP: {path_abs.name} - {reason}: {e}")
             continue
 
-        # Caminho relativo (sempre com /) em relação à raiz
-        path_rel = str(path_abs.relative_to(root)).replace("\\", "/")
-        entries.append(FileEntry(path_abs=path_abs, path_rel=path_rel, size=size))
+    # Relatório de arquivos pulados
+    if skipped_count > 0:
+        print(f"\n[SCAN] 📊 Resumo: {skipped_count} arquivo(s) ignorado(s)")
+        for reason, count in skipped_reasons.items():
+            print(f"       - {reason}: {count}")
+        print()
 
     # Ordena para estabilidade (opcional, mas ajuda em testes)
     entries.sort(key=lambda e: e.path_rel.lower())
@@ -256,12 +320,17 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
 
     Cada frame é simplesmente um pedaço do "stream" concatenado de todos os
     arquivos, na ordem de `entries`.
+    
+    Arquivos inacessíveis (em uso, sem permissão, etc.) são pulados com aviso.
 
     Retorna tuplas (frame_id, frame_data).
     """
     frame_size = int(frame_size)
     buffer = bytearray()
     frame_id = 0
+    
+    # Estatísticas de erros durante leitura
+    skipped_files = []
 
     import mmap
     
@@ -309,9 +378,62 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
                                 buffer.extend(mm[cursor:cursor+remaining_file])
                                 cursor += remaining_file
                                 
-        except Exception as e:
-            print(f"[IO] Erro ao ler {entry.path_abs}: {e}")
+        except PermissionError:
+            reason = "Permissão negada"
+            skipped_files.append((entry.path_rel, reason))
+            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
             continue
+            
+        except FileNotFoundError:
+            reason = "Arquivo não encontrado/movido durante compressão"
+            skipped_files.append((entry.path_rel, reason))
+            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
+            continue
+            
+        except OSError as e:
+            # Detectar motivos específicos do Windows
+            error_code = getattr(e, 'winerror', None) or e.errno
+            
+            if error_code == 32:  # ERROR_SHARING_VIOLATION
+                reason = "Arquivo em uso por outro processo"
+            elif error_code == 5:  # ERROR_ACCESS_DENIED
+                reason = "Acesso negado pelo sistema"
+            elif error_code == 33:  # ERROR_LOCK_VIOLATION
+                reason = "Arquivo bloqueado por outro processo"
+            elif error_code == 1224:  # ERROR_USER_MAPPED_FILE
+                reason = "Arquivo mapeado por outro processo"
+            else:
+                reason = f"Erro de I/O ({error_code}): {e}"
+                
+            skipped_files.append((entry.path_rel, reason))
+            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
+            continue
+            
+        except ValueError as e:
+            # mmap pode lançar ValueError para arquivos vazios ou problemas de mapeamento
+            if "cannot mmap an empty file" in str(e):
+                continue  # Arquivo vazio, não precisa avisar
+            reason = f"Erro de mapeamento: {e}"
+            skipped_files.append((entry.path_rel, reason))
+            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
+            continue
+            
+        except Exception as e:
+            reason = f"Erro inesperado ({type(e).__name__}): {e}"
+            skipped_files.append((entry.path_rel, reason))
+            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
+            continue
+
+    # Relatório final de arquivos pulados
+    if skipped_files:
+        print(f"\n[IO] 📊 Resumo: {len(skipped_files)} arquivo(s) pulado(s) durante leitura")
+        # Agrupar por motivo
+        reasons_count = {}
+        for _, reason in skipped_files:
+            reasons_count[reason] = reasons_count.get(reason, 0) + 1
+        for reason, count in reasons_count.items():
+            print(f"      - {reason}: {count}")
+        print()
 
     # Sobrou algo no buffer (último frame parcial)
     if buffer:
