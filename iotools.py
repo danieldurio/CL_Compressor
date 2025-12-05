@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Dict, Any, Optional, Tuple
 import json
+import os
+import threading
+from queue import Queue, Empty
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +40,140 @@ class FileEntry:
         return self.path_rel
 
 
-def scan_directory(root: Path) -> List[FileEntry]:
+# Configuração do scanner paralelo
+NUM_SCAN_WORKERS = 16  # Número fixo de workers para scanning paralelo
+
+
+def scan_directory_parallel(root: Path) -> List[FileEntry]:
+    """
+    Scanner paralelo com work-stealing.
+    Usa 3 workers fixos que subdividem diretórios grandes dinamicamente.
+    
+    Cada worker processa apenas 1 nível por vez:
+    - Arquivos → adiciona à lista local
+    - Subdiretórios → adiciona à fila para outros workers
+    
+    Isso garante balanceamento de carga mesmo quando um subdir é gigante.
+    """
+    root = root.resolve()
+    
+    # Fila thread-safe de diretórios a processar
+    work_queue: Queue[Path] = Queue()
+    
+    # Lock para contagem de workers ativos (para detectar término)
+    active_workers = [0]
+    active_lock = threading.Lock()
+    all_done = threading.Event()
+    
+    # Resultados por worker (sem compartilhamento durante processamento)
+    results: List[List[FileEntry]] = [[] for _ in range(NUM_SCAN_WORKERS)]
+    
+    # Estatísticas thread-safe
+    stats = {"dirs_processed": 0, "files_found": 0}
+    stats_lock = threading.Lock()
+    
+    def process_path(path_abs: Path) -> Optional[FileEntry]:
+        """Converte path em FileEntry."""
+        try:
+            if not path_abs.is_file():
+                return None
+            size = path_abs.stat().st_size
+            path_rel = str(path_abs.relative_to(root)).replace("\\", "/")
+            return FileEntry(path_abs=path_abs, path_rel=path_rel, size=size)
+        except (PermissionError, FileNotFoundError, OSError):
+            return None
+    
+    def worker(worker_id: int):
+        """Worker que processa diretórios da fila."""
+        local_entries = results[worker_id]
+        local_dirs_count = 0
+        local_files_count = 0
+        
+        while not all_done.is_set():
+            try:
+                # Tentar pegar trabalho da fila
+                current_dir = work_queue.get(timeout=0.05)
+            except Empty:
+                # Fila vazia - verificar se todos terminaram
+                with active_lock:
+                    if active_workers[0] == 0 and work_queue.empty():
+                        all_done.set()
+                continue
+            
+            # Marcar como ativo
+            with active_lock:
+                active_workers[0] += 1
+            
+            try:
+                # Processar diretório atual (apenas 1 nível)
+                with os.scandir(current_dir) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                # Subdiretório → adicionar à fila para outros workers
+                                work_queue.put(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                # Arquivo → processar imediatamente
+                                file_entry = process_path(Path(entry.path))
+                                if file_entry:
+                                    local_entries.append(file_entry)
+                                    local_files_count += 1
+                        except (PermissionError, OSError):
+                            pass
+                local_dirs_count += 1
+            except (PermissionError, OSError):
+                pass
+            finally:
+                # Marcar como inativo
+                with active_lock:
+                    active_workers[0] -= 1
+                work_queue.task_done()
+        
+        # Atualizar estatísticas globais
+        with stats_lock:
+            stats["dirs_processed"] += local_dirs_count
+            stats["files_found"] += local_files_count
+    
+    # Inicializar fila com diretório raiz
+    work_queue.put(root)
+    
+    # Iniciar workers
+    threads = []
+    for i in range(NUM_SCAN_WORKERS):
+        t = threading.Thread(target=worker, args=(i,), name=f"ScanWorker-{i}", daemon=True)
+        t.start()
+        threads.append(t)
+    
+    # Aguardar término de todos workers
+    for t in threads:
+        t.join()
+    
+    # Merge: combinar resultados de todos workers
+    all_entries: List[FileEntry] = []
+    for worker_entries in results:
+        all_entries.extend(worker_entries)
+    
+    # Ordenar para consistência
+    all_entries.sort(key=lambda e: e.path_rel.lower())
+    
+    print(f"[SCAN] ✓ {len(all_entries)} arquivos encontrados | {stats['dirs_processed']} dirs | {NUM_SCAN_WORKERS} workers")
+    return all_entries
+
+
+def scan_directory(root: Path, parallel: bool = True) -> List[FileEntry]:
     """
     Varre recursivamente a pasta `root` e monta a lista de FileEntry.
+    
+    Args:
+        root: Diretório raiz para escanear
+        parallel: Se True (padrão), usa scanning paralelo com work-stealing.
+                  Se False, usa scanning serial tradicional.
     
     Arquivos/pastas inacessíveis são ignorados com aviso no console.
     Motivos de skip: permissão negada, arquivo em uso, caminho inválido, etc.
     """
+    if parallel:
+        return scan_directory_parallel(root)
     entries: List[FileEntry] = []
     root = root.resolve()
     
