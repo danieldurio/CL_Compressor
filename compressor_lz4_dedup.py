@@ -15,12 +15,15 @@ import argparse
 from pathlib import Path
 from typing import Iterable, List, Dict, Any, Optional
 import time
+import sys
 
 from iotools import (
     FileEntry, VolumeWriter, generate_frames, estimate_total_size,
     scan_directory, FrameMeta
 )
+import iotools
 from deduplicator import GPUFileDeduplicator
+from vss import vss_shadow, VSSException
 
 # Carregar configurações do config.txt centralizado
 import config_loader
@@ -54,6 +57,9 @@ READ_BUFFER_BATCHES = config_loader.get_read_buffer_batches()
 WRITE_BUFFER_BATCHES = config_loader.get_write_buffer_batches()
 # ============================================================
 
+import threading
+import acls
+
 def compress_directory_lz4(
     entries: Iterable[FileEntry],
     frame_size: int,
@@ -61,10 +67,12 @@ def compress_directory_lz4(
     output_base: Path,
     index_params: Dict[str, Any],
     total_size_to_compress: int = 0,
+    acls_callback = None,
 ) -> List[FrameMeta]:
     """
     Compressor focado em LZ4 GPU e Deduplicação.
     Suporta Múltiplas GPUs para paralelismo.
+    acls_callback: Função a ser chamada assim que a leitura terminar (reader_done).
     """
     writer = VolumeWriter(output_base, max_volume_size)
     all_frames: List[FrameMeta] = []
@@ -73,6 +81,16 @@ def compress_directory_lz4(
     USE_CPU_FALLBACK = False
     BATCH_SIZE = BATCH_SIZE_OVERRIDE if BATCH_SIZE_OVERRIDE is not None else 24  # Default
     
+    # Filas e eventos
+    import queue
+    frame_queue = queue.Queue(maxsize=READ_BUFFER_BATCHES if READ_BUFFER_BATCHES else 128)
+    compressor_queue = queue.Queue() # This queue is for compressors, not frames
+    write_queue = queue.Queue(maxsize=WRITE_BUFFER_BATCHES if WRITE_BUFFER_BATCHES else 256)
+    
+    processing_done = threading.Event()
+    reader_done = threading.Event()
+    pipeline_error = threading.Event()
+
     # Verificar se modo CPU foi forçado via --cpu
     if FORCE_CPU_MODE:
         USE_CPU_FALLBACK = True
@@ -313,10 +331,6 @@ def compress_directory_lz4(
 
     # Execução Paralela com Pipeline I/O
     num_workers = len(compressors) if compressors else 1
-    # BATCH_SIZE já foi definido no início da função
-    
-    import threading
-    
     # Filas do pipeline com tamanhos configuráveis
     read_queue_size = BATCH_SIZE * READ_BUFFER_BATCHES
     # A fila de escrita armazena BATCHES inteiros, não frames individuais
@@ -334,7 +348,7 @@ def compress_directory_lz4(
     
     # ================================================================
     # THREAD 1: READER (Produtor - lê frames do disco)
-    # ================================================================
+    # ================================================================    # Workers
     def reader_thread():
         """Lê frames em background e enfileira para processamento."""
         try:
@@ -344,6 +358,13 @@ def compress_directory_lz4(
                 if len(frame_data) == 0:
                     continue
                 frame_queue.put((frame_id, frame_data))
+                
+            # FIM DA LEITURA (IO Finished)
+            # Acionar callback de ACLs aqui, enquanto o compressor ainda trabalha
+            if acls_callback:
+                print("[Reader] Leitura de frames finalizada. Disparando trigger de ACLs...")
+                acls_callback()
+                
         except Exception as e:
             print(f"[Reader] Erro: {e}")
             pipeline_error.set()
@@ -535,41 +556,8 @@ def compress_directory_lz4(
     
     return all_frames
 
-def main() -> int:
-    global FORCE_CPU_MODE
-    
-    parser = argparse.ArgumentParser(description="Compressor LZ4 GPU + Deduplicação")
-    parser.add_argument("source", help="Pasta de origem")
-    parser.add_argument("-o", "--output", default="archive_lz4.gpu", help="Base de saída")
-    parser.add_argument("--frame-size-mb", type=int, default=16, help="Tamanho do frame (MB) - recomendado: 16-32 para janela de 16MB")
-    parser.add_argument("--volume-size-mb", type=int, default=98, help="Tamanho do volume (MB)")
-    parser.add_argument("--cpu", action="store_true", help="Forçar modo CPU (ignorar GPU/OpenCL)")
-    
-    args = parser.parse_args()
-    
-    # Aplicar flag --cpu
-    if args.cpu:
-        FORCE_CPU_MODE = True
-    
-    source_dir = Path(args.source).resolve()
-    if not source_dir.is_dir():
-        print(f"Erro: '{source_dir}' não é um diretório.")
-        return 1
-    
-    output_base = Path(args.output).resolve()
-    frame_size = args.frame_size_mb * 1024 * 1024
-    max_volume_size = args.volume_size_mb * 1024 * 1024
-    
-    print("="*70)
-    if FORCE_CPU_MODE:
-        print("COMPRESSOR LZ4 CPU (--cpu)")
-    else:
-        print("COMPRESSOR LZ4 GPU + DEDUP")
-    print("="*70)
-    print(f"Fonte: {source_dir}")
-    print(f"Saída: {output_base}")
-    print("="*70)
-    
+def run_compression_logic(source_dir: Path, output_base: Path, frame_size: int, max_volume_size: int, args=None):
+    """Encapsula a lógica de compressão principal."""
     # 1. Scan
     entries = scan_directory(source_dir)
     if not entries:
@@ -584,6 +572,7 @@ def main() -> int:
         print("\n[Fase 1] Deduplicação CPU...")
     else:
         print("\n[Fase 1] Deduplicação GPU...")
+    
     deduplicator = GPUFileDeduplicator()
     entries = deduplicator.find_duplicates(entries)
     
@@ -600,7 +589,7 @@ def main() -> int:
         print("\n[Fase 2] Compressão LZ4 CPU...")
     else:
         print("\n[Fase 2] Compressão LZ4 GPU...")
-    print(f"[Compressor] Parâmetros: frame_size={args.frame_size_mb}MB, max_volume={args.volume_size_mb}MB")
+    print(f"[Compressor] Parâmetros: frame_size={frame_size // 1024 // 1024}MB, max_volume={max_volume_size // 1024 // 1024}MB")
     
     index_params = {
         "frame_size": frame_size,
@@ -611,6 +600,26 @@ def main() -> int:
         "compressor": "lz4_cpu" if FORCE_CPU_MODE else "lz4_gpu"
     }
     
+    # Configurar callback de ACLs
+    acls_thread = None
+    acls_callback = None
+    
+    if args and args.acls:
+        def trigger_acls():
+            nonlocal acls_thread
+            acls_output = Path(f"{output_base}.acls") # ex: f:/test.acls
+            # Iniciar thread
+            acls_thread = threading.Thread(
+                target=acls.backup_acls,
+                args=(source_dir, acls_output),
+                name="ACLsBackupThread",
+                daemon=True # Daemon=False para garantir que termine
+            )
+            acls_thread.daemon = False 
+            acls_thread.start()
+            
+        acls_callback = trigger_acls
+    
     compress_directory_lz4(
         entries=entries,
         frame_size=frame_size,
@@ -618,12 +627,83 @@ def main() -> int:
         output_base=output_base,
         index_params=index_params,
         total_size_to_compress=total_size_dedup,
+        acls_callback=acls_callback,
     )
     
+    # Esperar backup de ACLs terminar se ainda estiver rodando
+    if acls_thread:
+        if acls_thread.is_alive():
+             print("[ACLS] Aguardando término da captura de metadados...")
+             acls_thread.join()
+
+def main() -> int:
+    global FORCE_CPU_MODE
+    
+    parser = argparse.ArgumentParser(description="Compressor LZ4 GPU + Deduplicação")
+    parser.add_argument("source", help="Pasta de origem")
+    parser.add_argument("-o", "--output", default="archive_lz4.gpu", help="Base de saída")
+    parser.add_argument("--frame-size-mb", type=int, default=16, help="Tamanho do frame (MB) - recomendado: 16-32 para janela de 16MB")
+    parser.add_argument("--volume-size-mb", type=int, default=98, help="Tamanho do volume (MB)")
+    parser.add_argument("--cpu", action="store_true", help="Forçar modo CPU (ignorar GPU/OpenCL)")
+    parser.add_argument("--vss", action="store_true", help="Usar Volume Shadow Copy (VSS) para ler arquivos em uso (somente Windows, requer Admin)")
+    parser.add_argument("--acls", action="store_true", help="Backup de ACLs/Atributos em arquivo .acls separado")
+
+    args = parser.parse_args()
+    
+    # Aplicar flag --cpu
+    if args.cpu:
+        FORCE_CPU_MODE = True
+    
+    source_dir_orig = Path(args.source).resolve()
+    if not source_dir_orig.is_dir():
+        print(f"Erro: '{source_dir_orig}' não é um diretório.")
+        return 1
+    
+    output_base = Path(args.output).resolve()
+    frame_size = args.frame_size_mb * 1024 * 1024
+    max_volume_size = args.volume_size_mb * 1024 * 1024
+    
+    print("="*70)
+    if FORCE_CPU_MODE:
+        print("COMPRESSOR LZ4 CPU (--cpu)")
+    else:
+        print("COMPRESSOR LZ4 GPU + DEDUP")
+    print("="*70)
+    print(f"Fonte: {source_dir_orig}")
+    print(f"Saída: {output_base}")
+    print("="*70)
+
+    # Lógica de VSS com Fallback Gracioso
+    if args.vss:
+        vss_success = False
+        try:
+            with vss_shadow(str(source_dir_orig)) as shadow_path:
+                print(f"[VSS] Usando a cópia de sombra em: {shadow_path}")
+                source_dir_vss = Path(shadow_path)
+                run_compression_logic(source_dir_vss, output_base, frame_size, max_volume_size, args)
+                vss_success = True
+        except VSSException as e:
+            print(f"\n[AVISO VSS] Falha ao criar Cópia de Sombra: {e}", file=sys.stderr)
+            print("[AVISO VSS] Continuando compressão usando acesso direto aos arquivos (arquivos em uso podem falhar)...", file=sys.stderr)
+        except Exception as e:
+            print(f"\n[ERRO VSS] Erro inesperado no VSS: {e}", file=sys.stderr)
+            print("[AVISO VSS] Continuando compressão usando acesso direto aos arquivos...", file=sys.stderr)
+        
+        if not vss_success:
+             print("\n" + "="*70)
+             print("MODO DE COMPRESSÃO: DIRETO (Sem VSS)")
+             print("="*70)
+             run_compression_logic(source_dir_orig, output_base, frame_size, max_volume_size, args)
+    else:
+        run_compression_logic(source_dir_orig, output_base, frame_size, max_volume_size, args)
+
     print("\n" + "="*70)
     print("✅ Processo Completo Finalizado!")
     print("="*70)
     return 0
 
 if __name__ == "__main__":
+    # Tentar habilitar SeBackupPrivilege no Windows para leitura de arquivos protegidos
+    iotools.enable_se_backup_privilege()
+
     raise SystemExit(main())

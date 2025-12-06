@@ -28,7 +28,7 @@ FORCE_CPU_MODE = False
 #     VRAM 8-12 GB → 32-64 frames
 #     VRAM 12+ GB  → 64-128 frames
 #   Valores muito altos podem causar erros de memória GPU!
-COMPRESSOR_BATCH_SIZE = 73
+COMPRESSOR_BATCH_SIZE = 72
 
 # READ_BUFFER_BATCHES - Número de batches em buffer para leitura antecipada (read-ahead)
 #   Maior valor = Mais RAM usada, menos espera por I/O de leitura
@@ -52,7 +52,7 @@ WRITE_BUFFER_BATCHES = 1
 # DECOMPRESSOR_BATCH_SIZE - Número de frames por batch na descompressão
 #   None = Cálculo automático baseado em VRAM (recomendado)
 #   Ou valor inteiro conforme tabela de VRAM acima
-DECOMPRESSOR_BATCH_SIZE = None
+DECOMPRESSOR_BATCH_SIZE = 72
 
 # MAX_WORKER_THREADS - Número de threads paralelas para descompressão
 #   Menos threads = Menor contenção de GPU OpenCL

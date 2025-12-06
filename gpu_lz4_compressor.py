@@ -5,7 +5,7 @@ import pyopencl as cl
 import numpy as np
 import lz4.frame
 import time
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 import contextlib
 
 # Carregar configurações do config.txt centralizado

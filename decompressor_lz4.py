@@ -35,6 +35,9 @@ try:
 except ImportError:
     GPU_SELECTOR_AVAILABLE = False
 
+import acls
+import iotools
+
 # Carregar configurações do config.txt centralizado
 import config_loader
 
@@ -407,6 +410,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Descompressor LZ4 GPU (Embedded Index)")
     parser.add_argument("archive_base", help="Caminho de qualquer volume (ex: F:\\saida_final.001)")
     parser.add_argument("-o", "--output", required=True, help="Pasta de destino")
+    parser.add_argument("--acls", action="store_true", help="Restaurar ACLs/Atributos se disponível (arquivo .acls)")
     
     args = parser.parse_args()
     
@@ -802,17 +806,42 @@ def main() -> int:
     print(f"Descompressão concluída!")
     print(f"{'='*60}")
     print(f"Tempo total:      {total_time:.1f}s")
-    print(f"Frames totais:    {total_frames}")
-    print(f"  - GPU:          {gpu_frames_count} ({100*gpu_frames_count/total_frames:.1f}%)")
-    print(f"  - CPU:          {cpu_frames_count} ({100*cpu_frames_count/total_frames:.1f}%)")
     print(f"Dados escritos:   {bytes_written / 1024 / 1024:.1f} MB")
     print(f"Velocidade média: {avg_speed:.1f} MB/s")
     print(f"{'='*60}\n")
     
+    # ------------------------------------------------------------------
+    # RESTORE ACLS (Opcional)
+    # ------------------------------------------------------------------
+    if args.acls:
+        print("\n" + "="*60)
+        print("RESTAURAÇÃO DE ACLS/METADATA")
+        print("="*60)
+        
+        # Tentar habilitar privilégios
+        if iotools.enable_se_restore_privilege():
+             print("[System] SeRestorePrivilege habilitado (permite definir Owner/SACL).")
+        if iotools.enable_se_security_privilege():
+             print("[System] SeSecurityPrivilege habilitado (permite manipular SACLs auditoria).")
+        
+        # Localizar arquivo .acls
+        candidates = [
+            parent_dir / f"{prefix}.acls",
+            parent_dir / f"{prefix}.gpu.acls",
+            base_path.with_suffix(".acls")
+        ]
+        
+        acls_found = None
+        for cand in candidates:
+            if cand.exists():
+                acls_found = cand
+                break
+                
+        if acls_found:
+             acls.restore_acls(acls_found, output_dir)
+        else:
+             print(f"[ACLS] Aviso: Arquivo .acls não encontrado. (Procurado: {[str(c) for c in candidates]})")
+
     return 0
-
-    
-    
-
 if __name__ == "__main__":
     raise SystemExit(main())

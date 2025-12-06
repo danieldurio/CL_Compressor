@@ -732,3 +732,93 @@ def embed_index_file(
         f.write(footer)
         
     print(f"[Index] Footer gravado. Offset={start_offset}, Size={c_size}")
+
+# ---------------------------------------------------------------------------
+# Privilégios do Sistema (Windows)
+# ---------------------------------------------------------------------------
+
+def _enable_privilege(priv_name: str) -> bool:
+    """
+    Função genérica para habilitar privilégios no Windows.
+    """
+    import sys
+    if sys.platform != 'win32':
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+    
+    # Constantes
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_QUERY = 0x0008
+    SE_PRIVILEGE_ENABLED = 0x00000002
+    
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+    try:
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        
+        # DEFINIR TIPOS (CRUCIAL PARA 64-BIT)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        
+        # 1. Obter handle do token do processo
+        token = wintypes.HANDLE()
+        current_process = kernel32.GetCurrentProcess()
+        
+        if not advapi32.OpenProcessToken(current_process, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(token)):
+             err = kernel32.GetLastError()
+             print(f"[System] Falha ao abrir token do processo (OpenProcessToken). Error Code: {err}")
+             return False
+
+        # 2. Obter LUID do privilégio
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, priv_name, ctypes.byref(luid)):
+             err = kernel32.GetLastError()
+             print(f"[System] Falha ao buscar LUID ({priv_name}). Error Code: {err}")
+             kernel32.CloseHandle(token)
+             return False
+             
+        # 3. Ajustar privilégio
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+        
+        if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None):
+             err = kernel32.GetLastError()
+             print(f"[System] Falha ao ajustar Token ({priv_name}). Error Code: {err}")
+             kernel32.CloseHandle(token)
+             return False
+             
+        error = kernel32.GetLastError()
+        if error == 1300: # ERROR_NOT_ALL_ASSIGNED
+             print(f"[System] AVISO: O usuário não possui '{priv_name}' (Execute como Admin).")
+             kernel32.CloseHandle(token)
+             return False
+             
+        kernel32.CloseHandle(token)
+        print(f"[System] Privilégio '{priv_name}' habilitado com sucesso.")
+        return True
+        
+    except Exception as e:
+        print(f"[System] Erro ao tentar habilitar privilégios: {e}")
+        return False
+
+def enable_se_backup_privilege() -> bool:
+    return _enable_privilege("SeBackupPrivilege")
+
+def enable_se_restore_privilege() -> bool:
+    return _enable_privilege("SeRestorePrivilege")
+
+def enable_se_security_privilege() -> bool:
+    return _enable_privilege("SeSecurityPrivilege") # Necessário para SACL
