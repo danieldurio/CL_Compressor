@@ -270,7 +270,6 @@ Restaurando 16496 arquivos para E:\teste...
 [GPU_LZ4] Worker threads: 2
 
 
-Progresso: 74/74 frames | 12.0 MB/s | GPU: 32 | CPU: 42 | Fila: 0
 
 Criando 1532 arquivos duplicados (dedup reverso)...
 
@@ -294,6 +293,5 @@ Frames totais:    74
   - 
 Dados escritos:   1182.6 MB
 
-Velocidade média: 11.8 MB/s
 
 ============================================================
