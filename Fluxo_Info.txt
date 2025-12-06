@@ -1,94 +1,79 @@
-┌──────────────────────────┐
-│        INÍCIO            │
-│  Usuário abre o app      │
-└─────────────┬────────────┘
-              ▼
-┌──────────────────────────┐
-│ 1. Configuração inicial  │
-│ - escolhe pasta/arquivos │
-│ - ajusta opções (GPU,    │
-│   nível, dedup, etc.)    │
-└─────────────┬────────────┘
-              ▼
-┌──────────────────────────┐
-│ 2. Varredura dos dados   │
-│ - lista arquivos         │
-│ - coleta metadados       │
-└─────────────┬────────────┘
-              ▼
-┌──────────────────────────┐
-│ 3. Fila de trabalho      │
-│ - cria fila de arquivos  │
-│   /blocos a processar    │
-└─────────────┬────────────┘
-              ▼
-┌──────────────────────────┐
-│ 4. Quebra em blocos      │
-│ - divide em chunks       │
-│   (tamanho fixo/variável)│
-└─────────────┬────────────┘
-              ▼
-┌───────────────────────────────────┐
-│ 5. Deduplicação                   │
-│ - calcula hash do bloco           │
-│ - consulta índice de blocos       │
-└───────┬───────────────────────────┘
-        │
-        │ bloco já existe?
-        ├─────────────► SIM
-        │               ┌──────────────────────────┐
-        │               │ 5A. Registrar referência │
-        │               │ - não comprime de novo   │
-        │               │ - salva só ponteiro      │
-        │               └─────────────┬────────────┘
-        │                             │
-        ▼                             ▼
-┌──────────────────────────┐   ┌────────────────────┐
-│ NÃO (bloco novo)         │   │ (volta para pegar  │
-│ 5B. Enviar para compressão│  │  próximo bloco)    │
-└─────────────┬────────────┘   └─────────┬──────────┘
-              ▼                          │
-┌───────────────────────────────────┐    │
-│ 6. Seleção da engine             │    │
-│ - GPU disponível e adequada?     │    │
-└───────┬──────────────────────────┘    │
-        │                               │
-        │ SIM                           │ NÃO
-        ▼                               ▼
-┌──────────────────────────┐   ┌──────────────────────────┐
-│ 6A. Compressão na GPU    │   │ 6B. Compressão na CPU    │
-│ - kernel LZ4 / janela    │   │ - LZ4 stream / fallback  │
-│   estendida              │   │                          │
-└─────────────┬────────────┘   └─────────────┬────────────┘
-              ▼                              ▼
-       ┌───────────────────────────────────────────┐
-       │ 7. Montagem do bloco comprimido           │
-       │ - empacota cabeçalho + payload           │
-       │ - associa com índice/ponteiros dedup     │
-       └─────────────┬────────────────────────────┘
-                     ▼
-          ┌──────────────────────────┐
-          │ 8. Montagem do arquivo   │
-          │ - escreve header geral   │
-          │ - grava tabela de blocos │
-          │ - grava blocos + refs    │
-          └─────────────┬────────────┘
+                     ✦ S I S T E M   O P E R A T I O N   F L O W ✦
+───────────────────────────────────────────────────────────────────────────
+                          ┌─────────────────────────┐
+                          │   [ INÍCIO DO PROCESSO ]│
+                          │        (Boot UI)        │
+                          └─────────────┬───────────┘
+                                        ▼
+                     ┌──────────────────────────────────────┐
+                     │ [1] CONFIGURAÇÃO INICIAL             │
+                     │  • seleção de arquivos/pastas        │
+                     │  • opções GPU / dedup / nível        │
+                     └───────────────┬──────────────────────┘
+                                     ▼
+                     ┌──────────────────────────────────────┐
+                     │ [2] SCAN / DISCOVERY                 │
+                     │  • varredura dos caminhos            │
+                     │  • coleta de metadados               │
+                     └───────────────┬──────────────────────┘
+                                     ▼
+                     ┌──────────────────────────────────────┐
+                     │ [3] JOB QUEUE GENERATOR              │
+                     │  • fila de blocos / arquivos         │
+                     │  • init de pipelines                 │
+                     └───────────────┬──────────────────────┘
+                                     ▼
+                     ┌──────────────────────────────────────┐
+                     │ [4] CHUNKING ENGINE                  │
+                     │  • divisão em blocos (fixed/var)     │
+                     │  • feed para dedup pipeline          │
+                     └───────────────┬──────────────────────┘
+                                     ▼
+             ┌─────────────────────────────────────────────────────────┐
+             │ [5] DEDUP CORE                                          │
+             │  • hashing (xxh3/sha/etc)                               │
+             │  • lookup de índice global                              │
+             └─────────────┬───────────────────────────────────────────┘
+                           │
+            ┌──────────────┴──────────────┐
+            ▼                             ▼
+┌───────────────────────────┐   ┌────────────────────────────┐
+│ [5A] BLOCO DUPLICADO       │   │ [5B] BLOCO NOVO             │
+│ • registrar referência      │   │ • enviar para compressor    │
+│ • skip compressão          │   │ • GPU → CPU fallback         │
+└──────────────┬─────────────┘   └──────────────┬──────────────┘
+               ▼                                 ▼
+   ┌───────────────────────────────┐   ┌───────────────────────────────┐
+   │ [6A] GPU LZ4 KERNEL           │   │ [6B] CPU LZ4 STREAM            │
+   │ • janela estendida            │   │ • fallback seguro              │
+   │ • parallel warps / WG        │   │ • baixa latência               │
+   └───────────────┬──────────────┘   └──────────────┬────────────────┘
+                   ▼                                 ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ [7] BLOCK ASSEMBLER                                     │
+        │ • metadados + payload                                   │
+        │ • mapping para índice                                   │
+        └───────────────┬─────────────────────────────────────────┘
                         ▼
-          ┌──────────────────────────┐
-          │ 9. Escrita em disco      │
-          │ - flush no arquivo final │
-          │ - salva checksums        │
-          └─────────────┬────────────┘
+        ┌─────────────────────────────────────────────────────────┐
+        │ [8] FILE CONTAINER BUILDER                              │
+        │ • header / version / flags                              │
+        │ • block table + dedup map                               │
+        └───────────────┬─────────────────────────────────────────┘
                         ▼
-          ┌──────────────────────────┐
-          │10. Verificação final     │
-          │ - valida índice/hash     │
-          │ - opcional: teste de     │
-          │   descompressão         │
-          └─────────────┬────────────┘
+        ┌─────────────────────────────────────────────────────────┐
+        │ [9] WRITE-OUT ENGINE                                    │
+        │ • gravação do container final                           │
+        │ • flush + checksums                                     │
+        └───────────────┬─────────────────────────────────────────┘
                         ▼
-          ┌──────────────────────────┐
-          │          FIM             │
-          │ - mostra resumo          │
-          │ - estatísticas           │
-          └──────────────────────────┘
+        ┌─────────────────────────────────────────────────────────┐
+        │ [10] FINAL VERIFICATION                                 │
+        │ • valida hashes / offsets                               │
+        │ • opcional: test decompress                             │
+        └─────────────────┬────────────────────────────────────────┘
+                          ▼
+                ┌────────────────────────────┐
+                │       [ F I M ]            │
+                │ • stats / resumo / logs    │
+                └────────────────────────────┘
