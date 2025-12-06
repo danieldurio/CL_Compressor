@@ -147,14 +147,12 @@ python decompressor_lz4.py <arquivo_saida.001> -o <pasta_destino>
 
 O projeto está em constante evolução. Planos futuros incluem:
 
-*   Escalabilidade Multi-GPU.
-*   Compressor de Streaming (`stdin`/`stdout`).
-*   Backend opcional Zstd-GPU.
 *   Tamanho de janela adaptativo.
 *   Ferramenta de reparo para volumes ausentes.
+*   Adicionar VSS ( Windows )
 
 ---
 
 ## 🤝 Contribuições
 
-Contribuições, *pull requests*, relatórios de problemas e sugestões são muito bem-vindos! Este é um projeto experimental e orientado à pesquisa, e sua ajuda é essencial para a melhoria contínua.
+Contribuições, *pull requests*, relatórios de problemas e sugestões são muito bem-vindos! Este é um projeto experimental, e sua ajuda é essencial para a melhoria contínua.
