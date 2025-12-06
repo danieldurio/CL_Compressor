@@ -22,12 +22,15 @@ from iotools import (
 )
 from deduplicator import GPUFileDeduplicator
 
+# Carregar configurações do config.txt centralizado
+import config_loader
+
 # Tentar importar GPU compressor, fallback para CPU se OpenCL não disponível
 OPENCL_AVAILABLE = False
 GPU_LZ4_Compressor = None
 
-# Flag global para forçar modo CPU (via --cpu)
-FORCE_CPU_MODE = False
+# Flag global para forçar modo CPU (via --cpu ou config.txt)
+FORCE_CPU_MODE = config_loader.is_force_cpu_mode()
 
 try:
     import pyopencl as cl
@@ -44,30 +47,11 @@ except ImportError as e:
 from compressor_fallback import CPU_LZ4_Compressor
 
 # ============================================================
-# CONFIGURAÇÃO DE BATCH SIZE
+# CONFIGURAÇÃO (carregada de config.txt)
 # ============================================================
-# Defina como None para cálculo automático baseado em GPU capabilities,
-# ou um valor inteiro para usar batch size fixo.
-# Exemplo: BATCH_SIZE_OVERRIDE = 24  # Usar batch fixo de 24 frames
-#          BATCH_SIZE_OVERRIDE = None # Calcular automaticamente (padrão)
-#2-4 GB	8-16 frames
-#4-8 GB	16-32 frames
-#8-12 GB	32-64 frames
-#12+ GB	64-128 frames
-
-BATCH_SIZE_OVERRIDE = None
-# ============================================================
-
-# ============================================================
-# CONFIGURAÇÃO DE I/O PIPELINE (BUFFER)
-# ============================================================
-# Número de batches em buffer para leitura antecipada (read-ahead)
-# Maior valor = mais RAM, menos espera por I/O de leitura
-READ_BUFFER_BATCHES = 1
-
-# Número de batches em buffer para escrita atrasada (write-behind)  
-# Maior valor = mais RAM, menos espera por I/O de escrita
-WRITE_BUFFER_BATCHES = 1
+BATCH_SIZE_OVERRIDE = config_loader.get_compressor_batch_size()
+READ_BUFFER_BATCHES = config_loader.get_read_buffer_batches()
+WRITE_BUFFER_BATCHES = config_loader.get_write_buffer_batches()
 # ============================================================
 
 def compress_directory_lz4(
@@ -335,7 +319,8 @@ def compress_directory_lz4(
     
     # Filas do pipeline com tamanhos configuráveis
     read_queue_size = BATCH_SIZE * READ_BUFFER_BATCHES
-    write_queue_size = BATCH_SIZE * WRITE_BUFFER_BATCHES
+    # A fila de escrita armazena BATCHES inteiros, não frames individuais
+    write_queue_size = WRITE_BUFFER_BATCHES if WRITE_BUFFER_BATCHES > 0 else 0
     
     frame_queue = queue.Queue(maxsize=read_queue_size)  # Frames lidos aguardando processamento
     write_queue = queue.Queue(maxsize=write_queue_size)  # Resultados aguardando escrita

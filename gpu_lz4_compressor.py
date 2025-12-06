@@ -8,16 +8,18 @@ import time
 from typing import Tuple, Optional
 import contextlib
 
-# Constantes LZ4 (devem ser as mesmas do kernel)
-# HASH_LOG = 18 -> 262144 entradas (1MB de memória global)
-# Mudamos para Global Memory para permitir uma tabela maior e melhorar o ratio
-# O impacto na performance é mitigado pelo cache L2 da GPU
-HASH_LOG = 20 # AJUSTAR O KERNEL IGUAL
-HASH_CANDIDATES = 7  # AJUSTAR O KERNEL IGUAL
+# Carregar configurações do config.txt centralizado
+import config_loader
+
+# Constantes LZ4 (carregadas de config.txt)
+HASH_LOG = config_loader.get_hash_log()
+HASH_CANDIDATES = config_loader.get_hash_candidates()
+GOOD_ENOUGH_MATCH = config_loader.get_good_enough_match()
 HASH_ENTRIES = (1 << HASH_LOG)
 HASH_TABLE_SIZE = HASH_ENTRIES * HASH_CANDIDATES
 
-LZ4_KERNEL_SOURCE = """
+# Template do kernel LZ4 OpenCL - usa .format() para substituir valores de config
+_LZ4_KERNEL_TEMPLATE = """
 // lz4_compress_ext3.cl
 // Implementação LZ4 Extendida com offsets de 3 bytes para OpenCL
 // Baseado no princípio LZ77, adaptado para um único work-item (gid=0).
@@ -26,12 +28,12 @@ LZ4_KERNEL_SOURCE = """
 // Constantes LZ4
 #define MIN_MATCH 4
 
-// Tabela de hash:
-// - HASH_LOG define o número de entradas base: 2^16 = 65536
-// - Cada entrada guarda HASH_CANDIDATES posições recentes
-#define HASH_LOG        20u
-#define HASH_ENTRIES    (1u << HASH_LOG)     // 1048576 (1M)
-#define HASH_CANDIDATES 7u                    // Top-K adaptativo: 8 candidatos mais recentes
+// Tabela de hash (valores configuráveis via config.txt):
+// - HASH_LOG define o número de entradas base: 2^HASH_LOG
+// - HASH_CANDIDATES define quantas posições cada entrada guarda
+#define HASH_LOG        {hash_log}u
+#define HASH_ENTRIES    (1u << HASH_LOG)
+#define HASH_CANDIDATES {hash_candidates}u
 #define HASH_TABLE_SIZE (HASH_ENTRIES * HASH_CANDIDATES)
 
 // Hash LZ4 padrão
@@ -54,35 +56,35 @@ LZ4_KERNEL_SOURCE = """
 #define DBG_ERROR_OP_LIMIT 8u
 
 // Função de hash macro (4 bytes)
-#define HASH_FUNC(pos) ((input_data[pos] | (input_data[pos+1] << 8) | \
-                         (input_data[pos+2] << 16) | (input_data[pos+3] << 24)) \
+#define HASH_FUNC(pos) ((input_data[pos] | (input_data[pos+1] << 8) | \\
+                         (input_data[pos+2] << 16) | (input_data[pos+3] << 24)) \\
                         * PRIME) >> (32 - HASH_LOG)
 
 // Função de hash de 4 bytes do LZ4
-inline uint LZ4_hash4(const __global uchar* ptr) {
+inline uint LZ4_hash4(const __global uchar* ptr) {{
     uint value = (uint)ptr[0] |
                  ((uint)ptr[1] << 8) |
                  ((uint)ptr[2] << 16) |
                  ((uint)ptr[3] << 24);
     return (value * PRIME) >> (32 - HASH_LOG);
-}
+}}
 
 // Função para escrever o comprimento estendido
-inline __global uchar* write_length(__global uchar* op, uint length, __global uchar* op_limit) {
+inline __global uchar* write_length(__global uchar* op, uint length, __global uchar* op_limit) {{
     // Fast path: maioria dos casos (len < 255)
-    if (length < 255) {
+    if (length < 255) {{
         if (op < op_limit) *op++ = (uchar)length;
         return op;
-    }
+    }}
 
-    while (length >= 255) {
+    while (length >= 255) {{
         if (op >= op_limit) return op;
         *op++ = 255;
         length -= 255;
-    }
+    }}
     if (op < op_limit) *op++ = (uchar)length;
     return op;
-}
+}}
 
 // ---------------------------------------------------------------------------
 // FIND_BEST_MATCH:
@@ -92,15 +94,15 @@ inline __global uchar* write_length(__global uchar* op, uint length, __global uc
 //  - Retorna best_match_pos / best_match_len via ponteiros
 // ---------------------------------------------------------------------------
 // Helper para carregar 4 bytes de forma segura (evita unaligned access crash)
-inline uint load4_safe(__global const uchar* p) {
+inline uint load4_safe(__global const uchar* p) {{
     return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
-}
+}}
 
 // Helper para carregar 8 bytes de forma segura
-inline ulong load8_safe(__global const uchar* p) {
+inline ulong load8_safe(__global const uchar* p) {{
     return (ulong)p[0] | ((ulong)p[1] << 8) | ((ulong)p[2] << 16) | ((ulong)p[3] << 24) |
            ((ulong)p[4] << 32) | ((ulong)p[5] << 40) | ((ulong)p[6] << 48) | ((ulong)p[7] << 56);
-}
+}}
 
 // ============================================================
 // OTIMIZAÇÃO: CACHE DE HASH EM MEMÓRIA PRIVADA
@@ -125,14 +127,14 @@ inline void find_best_match(
     uint* best_match_pos,
     uint* best_match_len,
     uint hash_value
-) {
+) {{
     uint base_index = hash_value * HASH_CANDIDATES;
 
     uint local_best_pos = 0;
     uint local_best_len = 0;
     
-    // Early exit threshold: 128 bytes = "good enough" match
-    #define GOOD_ENOUGH_MATCH 128u
+    // Early exit threshold: {good_enough_match} bytes = "good enough" match (configurável via config.txt)
+    #define GOOD_ENOUGH_MATCH {good_enough_match}u
 
     // ============================================================
     // OTIMIZAÇÃO: Pré-carregar candidatos em memória privada
@@ -140,12 +142,12 @@ inline void find_best_match(
     // Carregar todos os candidatos de uma vez reduz latência de memória
     uint candidates[HASH_CANDIDATES];
     #pragma unroll
-    for (uint i = 0; i < HASH_CANDIDATES; i++) {
+    for (uint i = 0; i < HASH_CANDIDATES; i++) {{
         candidates[i] = hash_table[base_index + i];
-    }
+    }}
 
     // Top-K Search: Iterate through all candidates (from most recent to oldest)
-    for (uint i = 0; i < HASH_CANDIDATES; i++) {
+    for (uint i = 0; i < HASH_CANDIDATES; i++) {{
         uint candidate_pos = candidates[i];
         
         // Early termination: empty slot means no more candidates
@@ -154,17 +156,17 @@ inline void find_best_match(
         uint distance = current_pos - candidate_pos;
         
         // Skip if invalid distance or out of bounds
-        if (distance == 0 || distance >= MAX_DISTANCE || candidate_pos + MIN_MATCH > input_size) {
+        if (distance == 0 || distance >= MAX_DISTANCE || candidate_pos + MIN_MATCH > input_size) {{
             continue;
-        }
+        }}
         
         // Quick 4-byte prefix check (using private copy avoids re-fetch)
         if (ip[0] != input_data[candidate_pos] ||
             ip[1] != input_data[candidate_pos + 1] ||
             ip[2] != input_data[candidate_pos + 2] ||
-            ip[3] != input_data[candidate_pos + 3]) {
+            ip[3] != input_data[candidate_pos + 3]) {{
             continue;  // Prefix mismatch, try next candidate
-        }
+        }}
 
         // Extend match (optimized: 8-byte and 4-byte chunks)
         uint match_len = MIN_MATCH;
@@ -174,7 +176,7 @@ inline void find_best_match(
         uint max_match_len = last_literal_pos - current_pos;
 
         // Fast path: compare 8 bytes at a time (SAFE UNALIGNED LOAD)
-        while (match_len + 8 <= max_match_len) {
+        while (match_len + 8 <= max_match_len) {{
             ulong val1 = load8_safe(match_ip);
             ulong val2 = load8_safe(match_ref);
             if (val1 != val2) break;
@@ -182,10 +184,10 @@ inline void find_best_match(
             match_len += 8;
             match_ip += 8;
             match_ref += 8;
-        }
+        }}
 
         // Fast path: compare 4 bytes at a time (SAFE UNALIGNED LOAD)
-        while (match_len + 4 <= max_match_len) {
+        while (match_len + 4 <= max_match_len) {{
             uint val1 = load4_safe(match_ip);
             uint val2 = load4_safe(match_ref);
             if (val1 != val2) break;
@@ -193,26 +195,26 @@ inline void find_best_match(
             match_len += 4;
             match_ip += 4;
             match_ref += 4;
-        }
+        }}
 
         // Slow path: byte by byte
-        while (match_len < max_match_len && *match_ip == *match_ref) {
+        while (match_len < max_match_len && *match_ip == *match_ref) {{
             match_len++;
             match_ip++;
             match_ref++;
-        }
+        }}
 
         // Update best if this match is better
-        if (match_len > local_best_len) {
+        if (match_len > local_best_len) {{
             local_best_len = match_len;
             local_best_pos = candidate_pos;
             
             // Early exit: found "good enough" match
-            if (match_len >= GOOD_ENOUGH_MATCH) {
+            if (match_len >= GOOD_ENOUGH_MATCH) {{
                 break;  // Stop searching, this match is good enough
-            }
-        }
-    }
+            }}
+        }}
+    }}
 
     // ============================================================
     // Update hash table: shift right and insert current_pos at position 0
@@ -220,14 +222,14 @@ inline void find_best_match(
     // ============================================================
     // Write back shifted values (only HASH_CANDIDATES-1 writes needed)
     #pragma unroll
-    for (uint i = HASH_CANDIDATES - 1; i > 0; i--) {
+    for (uint i = HASH_CANDIDATES - 1; i > 0; i--) {{
         hash_table[base_index + i] = candidates[i - 1];
-    }
+    }}
     hash_table[base_index] = current_pos;
 
     *best_match_pos = local_best_pos;
     *best_match_len = local_best_len;
-}
+}}
 
 __kernel void lz4_compress_block(
     __global const uchar* input_buffer,      // Buffer único contendo todos os frames concatenados
@@ -239,7 +241,7 @@ __kernel void lz4_compress_block(
     __global uint* hash_table_buffer,        // Buffer gigante contendo todas as tabelas hash (stride = HASH_TABLE_SIZE)
     __global uint* debug_out_buffer,         // Buffer de debug (stride = 1)
     __global uint* compressed_size_out_buffer // Buffer de tamanhos finais (stride = 1)
-) {
+) {{
     // Cada thread processa UM frame inteiro
     uint gid = get_global_id(0);
     
@@ -281,18 +283,18 @@ __kernel void lz4_compress_block(
 
     if (debug_out) *debug_out = DBG_LOOP_START;
 
-    while ((ip - input_data) < last_literal_pos && op < op_limit) {
+    while ((ip - input_data) < last_literal_pos && op < op_limit) {{
         // loop_safety_count removed - was causing premature exit on incompressible data
         
         uint current_pos = (uint)(ip - input_data);
         uint hash;
 
         // Hash Caching Check
-        if (current_pos == cached_pos) {
+        if (current_pos == cached_pos) {{
             hash = cached_hash;
-        } else {
+        }} else {{
             hash = LZ4_hash4(ip);
-        }
+        }}
 
         // --------------------------------------------------------------------
         // 1) MATCH EM ip (current_pos)
@@ -312,7 +314,7 @@ __kernel void lz4_compress_block(
         );
 
         // Se não encontrou match em ip: trata como literal simples
-        if (best_len1 < MIN_MATCH) {
+        if (best_len1 < MIN_MATCH) {{
             if (debug_out) *debug_out = DBG_NO_MATCH;
             consecutive_misses++;
 
@@ -321,23 +323,23 @@ __kernel void lz4_compress_block(
             
             // Nível 1: Misses moderados (16-64) - threshold reduzido pela metade
             // Skip progressivo: 1→2→4→8→16
-            if (consecutive_misses > 16 && consecutive_misses <= 64) {
+            if (consecutive_misses > 16 && consecutive_misses <= 64) {{
                 skip_step = min(16u, 1u << ((consecutive_misses - 16) / 16));
-            }
+            }}
             // Nível 2: Muitos misses (64-256) - dados muito incompressíveis
             // Skip mais agressivo: 16→32→64
-            else if (consecutive_misses > 64 && consecutive_misses <= 256) {
+            else if (consecutive_misses > 64 && consecutive_misses <= 256) {{
                 skip_step = min(64u, 16u + ((consecutive_misses - 64) / 32));
-            }
+            }}
             // Nível 3: Incompressível total (>256)
             // Skip máximo: 64 bytes de uma vez (dobrado de 32)
-            else if (consecutive_misses > 256) {
+            else if (consecutive_misses > 256) {{
                 skip_step = 64u;
-            }
+            }}
             
             ip += skip_step;
             continue;
-        }
+        }}
 
         // Temos um match em ip, então podemos considerar lazy parsing (lookahead).
         consecutive_misses = 0;
@@ -353,7 +355,7 @@ __kernel void lz4_compress_block(
         uint next_pos = current_pos + 1;
         
         // Otimização: Se o match atual já for bom o suficiente (>32), pula lazy parsing
-        if (best_len1 < 32 && next_pos < last_literal_pos) {
+        if (best_len1 < 32 && next_pos < last_literal_pos) {{
             uint best_pos2 = 0;
             uint best_len2 = 0;
             
@@ -376,14 +378,14 @@ __kernel void lz4_compress_block(
 
             // Só troca para o match em ip+1 se ele for "bem melhor"
             if (best_len2 >= MIN_MATCH &&
-                best_len2 >= best_len1 + LAZY_DELTA) {
+                best_len2 >= best_len1 + LAZY_DELTA) {{
 
                 sel_match_pos = best_pos2;
                 sel_match_len = best_len2;
                 sel_start_pos = next_pos;
                 sel_ip = ip + 1;
-            }
-        }
+            }}
+        }}
 
         if (debug_out) *debug_out = DBG_MATCH_FOUND;
 
@@ -397,23 +399,23 @@ __kernel void lz4_compress_block(
         // Output buffer pre-check: verifica espaço ANTES de emitir
         // Worst case: 1 token + 5 lit_len + literal_len + 3 offset + 5 match_len
         uint total_output_needed = 1 + 5 + literal_len + 3 + 5;
-        if (op + total_output_needed > op_limit) {
+        if (op + total_output_needed > op_limit) {{
             if (debug_out) *debug_out = DBG_ERROR_OP_LIMIT;
             break;
-        }
+        }}
 
         __global uchar* token_ptr = op++;
 
-        if (literal_len >= 15) {
+        if (literal_len >= 15) {{
             op = write_length(op, literal_len - 15, op_limit);
             if (op >= op_limit) break;
-        }
+        }}
 
         // Copia literais (Otimizado: 8 bytes por vez)
         __global const uchar* lit_src = input_data + anchor;
         uint lit_rem = literal_len;
         
-        while (lit_rem >= 8) {
+        while (lit_rem >= 8) {{
             // OTIMIZAÇÃO: Vectorized copy usando vload8/vstore8 (safe for unaligned)
             uchar8 vec = vload8(0, lit_src);
             vstore8(vec, 0, op);
@@ -421,11 +423,11 @@ __kernel void lz4_compress_block(
             op += 8;
             lit_src += 8;
             lit_rem -= 8;
-        }
-        while (lit_rem > 0) {
+        }}
+        while (lit_rem > 0) {{
             *op++ = *lit_src++;
             lit_rem--;
-        }
+        }}
 
         // Offset (3 bytes, formato extendido lz_ext3_gpu)
         uint offset = sel_start_pos - sel_match_pos;
@@ -442,29 +444,29 @@ __kernel void lz4_compress_block(
         token |= (uchar)(match_len_enc < 15 ? match_len_enc : 15);
         *token_ptr = token;
 
-        if (match_len_enc >= 15) {
+        if (match_len_enc >= 15) {{
             op = write_length(op, match_len_enc - 15, op_limit);
             if (op >= op_limit) break;
-        }
+        }}
 
         // Avança IP para o fim do match
         ip = input_data + sel_start_pos + match_len;
         anchor = (uint)(ip - input_data);
 
         // Atualiza hash para ip-2 (como em LZ4) se ainda houver espaço
-        if (match_len > MIN_MATCH && (ip - input_data) < last_literal_pos) {
+        if (match_len > MIN_MATCH && (ip - input_data) < last_literal_pos) {{
             uint pos_for_hash = (uint)(ip - input_data) - 2;
             __global const uchar* ptr_for_hash = input_data + pos_for_hash;
 
             uint h2 = LZ4_hash4(ptr_for_hash);
             uint base2 = h2 * HASH_CANDIDATES;
 
-            for (int c = (int)HASH_CANDIDATES - 1; c > 0; --c) {
+            for (int c = (int)HASH_CANDIDATES - 1; c > 0; --c) {{
                 hash_table[base2 + (uint)c] = hash_table[base2 + (uint)(c - 1)];
-            }
+            }}
             hash_table[base2 + 0] = pos_for_hash;
-        }
-    }
+        }}
+    }}
 
     if (debug_out) *debug_out = DBG_LOOP_END;
 
@@ -474,44 +476,51 @@ __kernel void lz4_compress_block(
     uint literal_len = input_size - anchor;
 
     uint length_bytes = (literal_len / 255) + 1;
-    if (op + 1 + length_bytes + literal_len < op_limit) {
+    if (op + 1 + length_bytes + literal_len < op_limit) {{
         if (debug_out) *debug_out = DBG_FINALIZATION;
 
         __global uchar* token_ptr = op++;
         uchar token = (uchar)((literal_len < 15 ? literal_len : 15) << 4);
         *token_ptr = token;
 
-        if (literal_len >= 15) {
+        if (literal_len >= 15) {{
             op = write_length(op, literal_len - 15, op_limit);
-        }
+        }}
 
         // Copia literais finais (Otimizado: 8 bytes por vez usando vload8/vstore8)
         __global const uchar* lit_src = input_data + anchor;
         uint lit_rem = literal_len;
         
         // Vectorized copy - 8 bytes at a time (coalesced access)
-        while (lit_rem >= 8) {
+        while (lit_rem >= 8) {{
             uchar8 vec = vload8(0, lit_src);
             vstore8(vec, 0, op);
             op += 8;
             lit_src += 8;
             lit_rem -= 8;
-        }
+        }}
         
         // Handle remaining bytes (< 8)
-        while (lit_rem > 0) {
+        while (lit_rem > 0) {{
             *op++ = *lit_src++;
             lit_rem--;
-        }
+        }}
 
         if (debug_out) *debug_out = DBG_SUCCESS;
-    } else {
+    }} else {{
         if (debug_out) *debug_out = DBG_ERROR_OP_LIMIT;
-    }
+    }}
 
     *compressed_size_out = (uint)(op - output_data);
-}
+}}
 """
+
+# Gerar kernel final substituindo os valores de configuração
+LZ4_KERNEL_SOURCE = _LZ4_KERNEL_TEMPLATE.format(
+    hash_log=HASH_LOG,
+    hash_candidates=HASH_CANDIDATES,
+    good_enough_match=GOOD_ENOUGH_MATCH
+)
 
 
 

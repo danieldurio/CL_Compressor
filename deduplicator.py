@@ -324,8 +324,9 @@ class GPUFileDeduplicator:
         # Otimização: Usar ThreadPoolExecutor para I/O paralelo
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import os
+        import config_loader
         
-        NUM_IO_WORKERS = 4  # Valor fixo
+        NUM_IO_WORKERS = config_loader.get_num_io_workers()
         
         def read_file_bytes(entry: FileEntry, mode: str) -> tuple:
             """
@@ -463,8 +464,8 @@ class GPUFileDeduplicator:
             # - GPU consome da fila (sempre cheia)
             # ===================================================================
             
-            NUM_READERS = 4  # Número de threads de leitura
-            BUFFER_SIZE = 256  # Buffer maior para acomodar múltiplos readers
+            NUM_READERS = config_loader.get_num_readers()
+            BUFFER_SIZE = config_loader.get_buffer_size()
             
             data_queue = queue.Queue(maxsize=BUFFER_SIZE)
             readers_done = threading.Event()

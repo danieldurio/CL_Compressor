@@ -39,9 +39,11 @@ class FileEntry:
     def rel_path(self) -> str:
         return self.path_rel
 
+# Carregar configurações do config.txt centralizado
+import config_loader
 
-# Configuração do scanner paralelo
-NUM_SCAN_WORKERS = 16  # Número fixo de workers para scanning paralelo
+# Configuração do scanner paralelo (carregada de config.txt)
+NUM_SCAN_WORKERS = config_loader.get_num_scan_workers()
 
 
 def scan_directory_parallel(root: Path) -> List[FileEntry]:
