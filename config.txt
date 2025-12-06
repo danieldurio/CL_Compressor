@@ -1,0 +1,131 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIVO CLOUD MANAGER - CONFIGURAÇÕES DE COMPRESSÃO/DEDUPLICAÇÃO
+# ═══════════════════════════════════════════════════════════════════════════════
+# Este arquivo centraliza todas as configurações de tuning para o sistema
+# de compressão LZ4 GPU, deduplicação e I/O.
+#
+# FORMATO: CHAVE = VALOR
+#   - Linhas começando com # são comentários
+#   - Valores podem ser: inteiros, True/False, ou None
+#   - Espaços em volta do = são ignorados
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                         COMPRESSOR LZ4 GPU                                     ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# FORCE_CPU_MODE - Forçar uso exclusivo de CPU, ignorando qualquer GPU disponível
+#   True  = Apenas CPU (útil para sistemas sem GPU ou debugging)
+#   False = Usar GPU quando disponível (padrão recomendado)
+FORCE_CPU_MODE = False
+
+# BATCH_SIZE_OVERRIDE - Número de frames processados de uma vez na GPU
+#   None = Cálculo automático baseado em VRAM (recomendado para maioria)
+#   Ou um valor inteiro baseado na VRAM da sua GPU:
+#     VRAM 2-4 GB  → 8-16 frames
+#     VRAM 4-8 GB  → 16-32 frames
+#     VRAM 8-12 GB → 32-64 frames
+#     VRAM 12+ GB  → 64-128 frames
+#   Valores muito altos podem causar erros de memória GPU!
+COMPRESSOR_BATCH_SIZE = 78
+
+# READ_BUFFER_BATCHES - Número de batches em buffer para leitura antecipada (read-ahead)
+#   Maior valor = Mais RAM usada, menos espera por I/O de leitura
+#   0 = INFINITO (CUIDADO! Alto consumo de RAM)
+#   1 = Mínimo (1 batch por vez, menor uso de RAM)
+#   Recomendado: 1-2 para sistemas com pouca RAM, 2-4 para RAM abundante
+READ_BUFFER_BATCHES = 1
+
+# WRITE_BUFFER_BATCHES - Número de batches em buffer para escrita atrasada (write-behind)
+#   Maior valor = Mais RAM usada, menos espera por I/O de escrita
+#   0 = INFINITO (CUIDADO! Alto consumo de RAM)
+#   1 = Mínimo (1 batch por vez, menor uso de RAM)
+#   Recomendado: 1-2 para HDDs lentos, 1 para SSDs rápidos
+WRITE_BUFFER_BATCHES = 1
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                         DECOMPRESSOR LZ4 GPU                                   ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# DECOMPRESSOR_BATCH_SIZE - Número de frames por batch na descompressão
+#   None = Cálculo automático baseado em VRAM (recomendado)
+#   Ou valor inteiro conforme tabela de VRAM acima
+DECOMPRESSOR_BATCH_SIZE = None
+
+# MAX_WORKER_THREADS - Número de threads paralelas para descompressão
+#   Menos threads = Menor contenção de GPU OpenCL
+#   Mais threads  = Maior paralelismo CPU-GPU
+#   Recomendado: 2-4 para GPUs mid-range, 1-2 para GPUs entry-level
+MAX_WORKER_THREADS = 2
+
+# GPU_FALLBACK_ENABLED - Habilitar fallback para CPU em caso de erro GPU
+#   True  = Se GPU falhar, automaticamente usa CPU (mais seguro)
+#   False = Erros GPU causam falha imediata (para debugging)
+GPU_FALLBACK_ENABLED = True
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                         SCANNER/IO TOOLS                                       ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# NUM_SCAN_WORKERS - Número de workers paralelos para scanning de diretórios
+#   Mais workers = Scan mais rápido em HDDs grandes e diretórios complexos
+#   Menos workers = Menor uso de CPU durante scan
+#   Recomendado: 2-4 para HDDs, 4-8 para SSDs/NVMe
+NUM_SCAN_WORKERS = 4
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                         DEDUPLICATOR                                           ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# NUM_IO_WORKERS - Número de workers I/O para leitura paralela de bytes (Stage 2-4)
+#   Mais workers = Leitura paralela mais rápida durante filtros byte-a-byte
+#   Menos workers = Menor stress no disco
+#   Recomendado: 4 para HDDs, 8-16 para SSDs
+NUM_IO_WORKERS = 4
+
+# NUM_READERS - Número de threads de leitura para hash GPU (Stage 5)
+#   Multi-Reader: Threads leem arquivos em paralelo para alimentar GPU
+#   Mais readers = GPU sempre ocupada (melhor throughput)
+#   Menos readers = Menor consumo de RAM para buffers
+#   Recomendado: 4-8 para a maioria dos sistemas
+NUM_READERS = 4
+
+# BUFFER_SIZE - Tamanho do buffer da fila entre readers e GPU (Stage 5)
+#   Maior buffer = GPU nunca fica ociosa esperando dados
+#   Menor buffer = Menor uso de RAM
+#   Recomendado: 128-256 para maioria, 64 para sistemas com pouca RAM
+BUFFER_SIZE = 256
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                         GPU LZ4 KERNEL (AVANÇADO)                              ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+# ⚠️ ATENÇÃO: Alterar estes valores requer recompilar o kernel OpenCL!
+#    Após modificar, o sistema usará os novos valores na próxima execução.
+#    Valores incorretos podem degradar significativamente a compressão.
+
+# HASH_LOG - Log2 do número de entradas base na tabela de hash
+#   Maior = Mais memória GPU, melhor taxa de compressão para dados grandes
+#   Menor = Menos memória GPU, mais colisões de hash
+#   Valor padrão: 20 (1M entradas = ~28MB de VRAM por frame/batch slot)
+#   Range típico: 16-22
+HASH_LOG = 20
+
+# HASH_CANDIDATES - Número de posições candidatas por entrada de hash (Top-K)
+#   Maior = Melhor ratio de compressão (encontra matches mais longos)
+#   Menor = Processamento mais rápido, menos memória
+#   Valor padrão: 7 (bom equilíbrio velocidade/ratio)
+#   Range típico: 4-12
+HASH_CANDIDATES = 24
+
+# GOOD_ENOUGH_MATCH - Comprimento de match considerado "bom o suficiente"
+#   Quando um match atinge este tamanho, para de procurar matches melhores
+#   Maior = Melhor ratio (continua buscando), mais lento
+#   Menor = Mais rápido (aceita matches curtos), pode piorar ratio
+#   Valor padrão: 128 bytes
+#   Range típico: 64-256
+GOOD_ENOUGH_MATCH = 256
