@@ -1,79 +1,160 @@
-                     ✦ S I S T E M   O P E R A T I O N   F L O W ✦
-───────────────────────────────────────────────────────────────────────────
-                          ┌─────────────────────────┐
-                          │   [ INÍCIO DO PROCESSO ]│
-                          │        (Boot UI)        │
-                          └─────────────┬───────────┘
-                                        ▼
-                     ┌──────────────────────────────────────┐
-                     │ [1] CONFIGURAÇÃO INICIAL             │
-                     │  • seleção de arquivos/pastas        │
-                     │  • opções GPU / dedup / nível        │
-                     └───────────────┬──────────────────────┘
-                                     ▼
-                     ┌──────────────────────────────────────┐
-                     │ [2] SCAN / DISCOVERY                 │
-                     │  • varredura dos caminhos            │
-                     │  • coleta de metadados               │
-                     └───────────────┬──────────────────────┘
-                                     ▼
-                     ┌──────────────────────────────────────┐
-                     │ [3] JOB QUEUE GENERATOR              │
-                     │  • fila de blocos / arquivos         │
-                     │  • init de pipelines                 │
-                     └───────────────┬──────────────────────┘
-                                     ▼
-                     ┌──────────────────────────────────────┐
-                     │ [4] CHUNKING ENGINE                  │
-                     │  • divisão em blocos (fixed/var)     │
-                     │  • feed para dedup pipeline          │
-                     └───────────────┬──────────────────────┘
-                                     ▼
-             ┌─────────────────────────────────────────────────────────┐
-             │ [5] DEDUP CORE                                          │
-             │  • hashing (xxh3/sha/etc)                               │
-             │  • lookup de índice global                              │
-             └─────────────┬───────────────────────────────────────────┘
-                           │
-            ┌──────────────┴──────────────┐
-            ▼                             ▼
-┌───────────────────────────┐   ┌────────────────────────────┐
-│ [5A] BLOCO DUPLICADO       │   │ [5B] BLOCO NOVO             │
-│ • registrar referência      │   │ • enviar para compressor    │
-│ • skip compressão          │   │ • GPU → CPU fallback         │
-└──────────────┬─────────────┘   └──────────────┬──────────────┘
-               ▼                                 ▼
-   ┌───────────────────────────────┐   ┌───────────────────────────────┐
-   │ [6A] GPU LZ4 KERNEL           │   │ [6B] CPU LZ4 STREAM            │
-   │ • janela estendida            │   │ • fallback seguro              │
-   │ • parallel warps / WG        │   │ • baixa latência               │
-   └───────────────┬──────────────┘   └──────────────┬────────────────┘
-                   ▼                                 ▼
-        ┌─────────────────────────────────────────────────────────┐
-        │ [7] BLOCK ASSEMBLER                                     │
-        │ • metadados + payload                                   │
-        │ • mapping para índice                                   │
-        └───────────────┬─────────────────────────────────────────┘
-                        ▼
-        ┌─────────────────────────────────────────────────────────┐
-        │ [8] FILE CONTAINER BUILDER                              │
-        │ • header / version / flags                              │
-        │ • block table + dedup map                               │
-        └───────────────┬─────────────────────────────────────────┘
-                        ▼
-        ┌─────────────────────────────────────────────────────────┐
-        │ [9] WRITE-OUT ENGINE                                    │
-        │ • gravação do container final                           │
-        │ • flush + checksums                                     │
-        └───────────────┬─────────────────────────────────────────┘
-                        ▼
-        ┌─────────────────────────────────────────────────────────┐
-        │ [10] FINAL VERIFICATION                                 │
-        │ • valida hashes / offsets                               │
-        │ • opcional: test decompress                             │
-        └─────────────────┬────────────────────────────────────────┘
-                          ▼
-                ┌────────────────────────────┐
-                │       [ F I M ]            │
-                │ • stats / resumo / logs    │
-                └────────────────────────────┘
+1. Inicialização do Sistema
+[Start]
+   │
+   ├──► Ler config.txt
+   │        ├─ FRAME_SIZE_MB
+   │        ├─ HASH_LOG / HASH_CANDIDATES
+   │        ├─ LIMIAR_RAW / GOOD_ENOUGH_MATCH / AUTO_SKIP
+   │        └─ Uso de GPU/CPU
+   │
+   ├──► Detectar GPUs OpenCL
+   │        ├─ VRAM total
+   │        ├─ Compute Units
+   │        └─ Batch Size recomendado (≈ 0.66 × VRAM disponível)
+   │
+   └──► Seleção de modo
+            ├─ GPU (kernel LZ4_EXT3)
+            └─ CPU Fallback
+
+2. Scanner de Arquivos (I/O Pipeline)
+[Scanner]
+   │
+   ├──► Explorar diretório recursivamente
+   │        └─ Criar FileEntry para cada arquivo:
+   │             • path absoluto / relativo
+   │             • tamanho
+   │             • datas (mtime / ctime)
+   │
+   ├──► Registrar estatísticas:
+   │        • arquivos encontrados
+   │        • diretórios processados
+   │
+   └──► Enviar FileEntry para fila de deduplicação
+3. Deduplicação em GPU (Hash FNV)
+[Deduplicator]
+   │
+   ├──► Agrupar arquivos por tamanho
+   │
+   ├──► Para grupos com N > 1:
+   │        ├─ Montar buffers de bytes para GPU
+   │        └─ Montar tabela de offsets
+   │
+   ├──► Kernel OpenCL: Hash FNV-1a 64-bit
+   │        └─ Processar arquivos em paralelo
+   │
+   ├──► Coletar hashes
+   │        ├─ hash → lista de arquivos
+   │        ├─ marcar duplicatas
+   │        └─ apontar arquivo original
+   │
+   └──► Produzir:
+            • lista de arquivos únicos
+            • tabela de duplicação
+
+4. Planejamento de Frames
+[Frame Planner]
+   │
+   ├──► Para cada arquivo único:
+   │        ├─ Dividir em frames (FRAME_SIZE_MB)
+   │        └─ Criar:
+   │             • frame_id
+   │             • file_id
+   │             • offset
+   │             • tamanho
+   │
+   └──► Enviar frames para a fila de compressão (batching)
+
+5. Compressão em GPU (LZ4_EXT3 Kernel)
+[Compressor GPU]
+   │
+   ├──► Montar buffers:
+   │        • input_buffer (frames concatenados)
+   │        • offsets_buffer
+   │        • output_buffer pré-alocado
+   │
+   ├──► Executar Kernel LZ4_EXT3:
+   │        ├─ hash table parametrizada (HASH_LOG)
+   │        ├─ múltiplos candidatos por índice (HASH_CANDIDATES)
+   │        ├─ busca top-K matches
+   │        ├─ heurística GOOD_ENOUGH_MATCH
+   │        └─ heurística AUTO_SKIP (ligares pouco compressíveis)
+   │
+   ├──► Avaliar compressibilidade do frame:
+   │        ├─ se ratio < LIMIAR_RAW → manter comprimido
+   │        └─ senão → marcar como RAW
+   │
+   └──► Registrar metadados:
+            • tipo (LZ4/RAW)
+            • tamanho original
+            • tamanho comprimido
+            • posição no volume
+
+6. Fallback CPU (quando aplicável)
+[CPU Fallback]
+   │
+   ├──► Condições:
+   │        • sem GPU
+   │        • falha do kernel
+   │        • modo forçado via CLI
+   │
+   ├──► Aplicar compressor CPU:
+   │        • LZ4 nativo
+   │        • ou variante EXT3 compatível
+   │
+   └──► Produzir frames equivalentes aos do pipeline GPU
+
+7. Escrita de Volumes (.gpu, .gpu.001, .gpu.002...)
+[Volume Writer]
+   │
+   ├──► Iniciar volume:
+   │        ├─ MAGIC
+   │        ├─ versão do formato
+   │        ├─ snapshot do config usado
+   │        └─ posição do índice
+   │
+   ├──► Gravar frames comprimidos ou RAW
+   │
+   ├──► Atualizar tabelas:
+   │        • file → frames
+   │        • frame → volume/offset/tipo/tamanho
+   │        • duplicatas → arquivo base
+   │
+   └──► Ao finalizar:
+            └─ escrever índice final (binário/JSON)
+
+8. Descompressão
+[Decompressor]
+   │
+   ├──► Abrir volume(s)
+   │        ├─ validar MAGIC / versão
+   │        └─ carregar índice
+   │
+   ├──► Para cada arquivo:
+   │        ├─ criar diretórios necessários
+   │        ├─ se for duplicata → apontar para original
+   │        └─ caso contrário → restaurar frames
+   │
+   ├──► Descomprimir frames:
+   │        ├─ RAW: copiar bytes
+   │        └─ LZ4_EXT3: reconstruir usando tokens
+   │             • literais
+   │             • matches com offset 3 bytes
+   │
+   └──► Reconstrução final:
+            • concatenar frames
+            • restaurar timestamps
+            • validar tamanho
+            • gravar arquivo final
+
+9. Relatórios e Ferramentas Auxiliares
+[Tools]
+   │
+   ├──► generate_tree_map.py
+   │        ├─ compara espaço original / pós-dedup / pós-compressão
+   │        └─ gera visualização hierárquica
+   │
+   ├──► test_pipeline.py
+   │        └─ simulações e testes de integridade
+   │
+   └──► compressor_lz4_stream.py
+            └─ compressão/decompressão via stdin/stdout
