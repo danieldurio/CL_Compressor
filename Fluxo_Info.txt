@@ -1,0 +1,94 @@
+┌──────────────────────────┐
+│        INÍCIO            │
+│  Usuário abre o app      │
+└─────────────┬────────────┘
+              ▼
+┌──────────────────────────┐
+│ 1. Configuração inicial  │
+│ - escolhe pasta/arquivos │
+│ - ajusta opções (GPU,    │
+│   nível, dedup, etc.)    │
+└─────────────┬────────────┘
+              ▼
+┌──────────────────────────┐
+│ 2. Varredura dos dados   │
+│ - lista arquivos         │
+│ - coleta metadados       │
+└─────────────┬────────────┘
+              ▼
+┌──────────────────────────┐
+│ 3. Fila de trabalho      │
+│ - cria fila de arquivos  │
+│   /blocos a processar    │
+└─────────────┬────────────┘
+              ▼
+┌──────────────────────────┐
+│ 4. Quebra em blocos      │
+│ - divide em chunks       │
+│   (tamanho fixo/variável)│
+└─────────────┬────────────┘
+              ▼
+┌───────────────────────────────────┐
+│ 5. Deduplicação                   │
+│ - calcula hash do bloco           │
+│ - consulta índice de blocos       │
+└───────┬───────────────────────────┘
+        │
+        │ bloco já existe?
+        ├─────────────► SIM
+        │               ┌──────────────────────────┐
+        │               │ 5A. Registrar referência │
+        │               │ - não comprime de novo   │
+        │               │ - salva só ponteiro      │
+        │               └─────────────┬────────────┘
+        │                             │
+        ▼                             ▼
+┌──────────────────────────┐   ┌────────────────────┐
+│ NÃO (bloco novo)         │   │ (volta para pegar  │
+│ 5B. Enviar para compressão│  │  próximo bloco)    │
+└─────────────┬────────────┘   └─────────┬──────────┘
+              ▼                          │
+┌───────────────────────────────────┐    │
+│ 6. Seleção da engine             │    │
+│ - GPU disponível e adequada?     │    │
+└───────┬──────────────────────────┘    │
+        │                               │
+        │ SIM                           │ NÃO
+        ▼                               ▼
+┌──────────────────────────┐   ┌──────────────────────────┐
+│ 6A. Compressão na GPU    │   │ 6B. Compressão na CPU    │
+│ - kernel LZ4 / janela    │   │ - LZ4 stream / fallback  │
+│   estendida              │   │                          │
+└─────────────┬────────────┘   └─────────────┬────────────┘
+              ▼                              ▼
+       ┌───────────────────────────────────────────┐
+       │ 7. Montagem do bloco comprimido           │
+       │ - empacota cabeçalho + payload           │
+       │ - associa com índice/ponteiros dedup     │
+       └─────────────┬────────────────────────────┘
+                     ▼
+          ┌──────────────────────────┐
+          │ 8. Montagem do arquivo   │
+          │ - escreve header geral   │
+          │ - grava tabela de blocos │
+          │ - grava blocos + refs    │
+          └─────────────┬────────────┘
+                        ▼
+          ┌──────────────────────────┐
+          │ 9. Escrita em disco      │
+          │ - flush no arquivo final │
+          │ - salva checksums        │
+          └─────────────┬────────────┘
+                        ▼
+          ┌──────────────────────────┐
+          │10. Verificação final     │
+          │ - valida índice/hash     │
+          │ - opcional: teste de     │
+          │   descompressão         │
+          └─────────────┬────────────┘
+                        ▼
+          ┌──────────────────────────┐
+          │          FIM             │
+          │ - mostra resumo          │
+          │ - estatísticas           │
+          └──────────────────────────┘
