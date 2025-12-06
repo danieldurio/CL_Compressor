@@ -53,7 +53,7 @@ PRIME = np.uint32(0x9E3779B1)  # Hash prime
 LAZY_DELTA = 2
 
 # Early exit threshold
-GOOD_ENOUGH_MATCH = 128
+GOOD_ENOUGH_MATCH = 256
 
 
 # ============================================================

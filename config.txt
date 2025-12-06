@@ -28,7 +28,7 @@ FORCE_CPU_MODE = False
 #     VRAM 8-12 GB → 32-64 frames
 #     VRAM 12+ GB  → 64-128 frames
 #   Valores muito altos podem causar erros de memória GPU!
-COMPRESSOR_BATCH_SIZE = 78
+COMPRESSOR_BATCH_SIZE = 73
 
 # READ_BUFFER_BATCHES - Número de batches em buffer para leitura antecipada (read-ahead)
 #   Maior valor = Mais RAM usada, menos espera por I/O de leitura
@@ -120,7 +120,7 @@ HASH_LOG = 20
 #   Menor = Processamento mais rápido, menos memória
 #   Valor padrão: 7 (bom equilíbrio velocidade/ratio)
 #   Range típico: 4-12
-HASH_CANDIDATES = 24
+HASH_CANDIDATES = 17
 
 # GOOD_ENOUGH_MATCH - Comprimento de match considerado "bom o suficiente"
 #   Quando um match atinge este tamanho, para de procurar matches melhores

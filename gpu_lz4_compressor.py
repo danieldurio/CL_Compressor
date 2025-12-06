@@ -16,7 +16,56 @@ HASH_LOG = config_loader.get_hash_log()
 HASH_CANDIDATES = config_loader.get_hash_candidates()
 GOOD_ENOUGH_MATCH = config_loader.get_good_enough_match()
 HASH_ENTRIES = (1 << HASH_LOG)
+
 HASH_TABLE_SIZE = HASH_ENTRIES * HASH_CANDIDATES
+
+def gen_opencl_vector_load(k, ptr, base_offset, dest_arr):
+    code = [f"// Vectorized Load for K={k} (Generated Python)"]
+    offset = 0
+    remaining = k
+    sizes = [16, 8, 4, 2, 1]
+    
+    for s in sizes:
+        while remaining >= s:
+            vec_offset_elem = offset // s
+            if s == 1:
+                code.append(f"{dest_arr}[{offset}] = {ptr}[{base_offset} + {offset}];")
+            else:
+                var_name = f"v_load_{offset}"
+                code.append(f"uint{s} {var_name} = vload{s}({vec_offset_elem}, {ptr} + {base_offset});")
+                # Unpack
+                opts = "0123456789ABCDEF"
+                for i in range(s):
+                    code.append(f"{dest_arr}[{offset + i}] = {var_name}.s{opts[i]};")
+            
+            remaining -= s
+            offset += s
+    return "\n    ".join(code)
+
+def gen_opencl_vector_store(k, ptr, base_offset, values):
+    code = [f"// Vectorized Store for K={k} (Generated Python)"]
+    offset = 0
+    remaining = k
+    sizes = [16, 8, 4, 2, 1]
+    val_idx = 0
+    
+    for s in sizes:
+        while remaining >= s:
+            vec_offset_elem = offset // s
+            if s == 1:
+                code.append(f"{ptr}[{base_offset} + {offset}] = {values[val_idx]};")
+                val_idx += 1
+            else:
+                var_name = f"v_store_{offset}"
+                code.append(f"uint{s} {var_name};")
+                for i in range(s):
+                    code.append(f"{var_name}.s{'0123456789ABCDEF'[i]} = {values[val_idx]};")
+                    val_idx += 1
+                code.append(f"vstore{s}({var_name}, {vec_offset_elem}, {ptr} + {base_offset});")
+            
+            remaining -= s
+            offset += s
+    return "\n    ".join(code)
 
 # Template do kernel LZ4 OpenCL - usa .format() para substituir valores de config
 _LZ4_KERNEL_TEMPLATE = """
@@ -140,11 +189,9 @@ inline void find_best_match(
     // OTIMIZAÇÃO: Pré-carregar candidatos em memória privada
     // ============================================================
     // Carregar todos os candidatos de uma vez reduz latência de memória
+    // USO EFICIENTE DE LOAD VETORIZADO PARA HASH_CANDIDATES={hash_candidates}
     uint candidates[HASH_CANDIDATES];
-    #pragma unroll
-    for (uint i = 0; i < HASH_CANDIDATES; i++) {{
-        candidates[i] = hash_table[base_index + i];
-    }}
+    {load_candidates_code}
 
     // Top-K Search: Iterate through all candidates (from most recent to oldest)
     for (uint i = 0; i < HASH_CANDIDATES; i++) {{
@@ -218,14 +265,10 @@ inline void find_best_match(
 
     // ============================================================
     // Update hash table: shift right and insert current_pos at position 0
-    // OTIMIZAÇÃO: Usar a cópia privada para determinar valores a escrever
+    // OTIMIZAÇÃO: Usar a cópia privada para determinar valores a escrever com STORE VETORIZADO
     // ============================================================
-    // Write back shifted values (only HASH_CANDIDATES-1 writes needed)
-    #pragma unroll
-    for (uint i = HASH_CANDIDATES - 1; i > 0; i--) {{
-        hash_table[base_index + i] = candidates[i - 1];
-    }}
-    hash_table[base_index] = current_pos;
+    // A lista a escrever é [current_pos, candidates[0], ... candidates[K-2]]
+    {update_hash_table_code}
 
     *best_match_pos = local_best_pos;
     *best_match_len = local_best_len;
@@ -515,11 +558,20 @@ __kernel void lz4_compress_block(
 }}
 """
 
+# Prepare values to write for the shift (current_pos, then candidates 0..K-2)
+_values_to_write = ["current_pos"] + [f"candidates[{i}]" for i in range(HASH_CANDIDATES - 1)]
+
+# Gerar código C customizado para acesso vetorial
+_load_code = gen_opencl_vector_load(HASH_CANDIDATES, "hash_table", "base_index", "candidates")
+_store_code = gen_opencl_vector_store(HASH_CANDIDATES, "hash_table", "base_index", _values_to_write)
+
 # Gerar kernel final substituindo os valores de configuração
 LZ4_KERNEL_SOURCE = _LZ4_KERNEL_TEMPLATE.format(
     hash_log=HASH_LOG,
     hash_candidates=HASH_CANDIDATES,
-    good_enough_match=GOOD_ENOUGH_MATCH
+    good_enough_match=GOOD_ENOUGH_MATCH,
+    load_candidates_code=_load_code,
+    update_hash_table_code=_store_code
 )
 
 
