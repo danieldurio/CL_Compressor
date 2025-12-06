@@ -1,297 +1,160 @@
-# 🚀 GPU-Accelerated Deduplication + LZ4 Compressor
+# 🚀 CL_Compressor: Motor de Compressão e Deduplicação Acelerado por GPU
 
-## The High-Performance Archival Compressor
+O **CL_Compressor** é uma solução de arquivamento de alto desempenho, projetada para processar grandes volumes de dados com eficiência e velocidade superiores. Ele combina uma arquitetura de pipeline assíncrona, um motor de deduplicação inteligente de múltiplos estágios e um kernel de compressão LZ4 totalmente personalizado e acelerado por GPU (OpenCL).
 
-This project is a **high-performance archival compression solution** that uses **GPU acceleration** to perform deduplication and LZ4 compression. Unlike traditional tools, it is designed to handle large volumes of data, such as *extensive directory backups*, offering a significantly higher compression throughput by leveraging the power of commodity Graphics Processing Units (GPUs).
+Desenvolvido para cenários de **backup, ingestão de dados em larga escala e arquivamento versionado**, o CL_Compressor transforma o gargalo de I/O e processamento em um fluxo de trabalho otimizado, aproveitando o poder de processamento paralelo das Unidades de Processamento Gráfico (GPUs).
 
-High-performance data compression and archival system leveraging GPU acceleration via OpenCL. It features a custom, highly optimized compression kernel and a multi-stage deduplication pipeline to achieve superior speed and efficiency.
+## ✨ Inovações e Tecnologias Chave
 
-## ✨ Key Features
+O projeto se destaca por uma série de otimizações que garantem o máximo *throughput* e a melhor taxa de compressão possível:
 
-The system is engineered for maximum throughput and efficiency, focusing on several critical optimizations:
+### 1. Kernel LZ4 Personalizado com Janela Estendida (OpenCL)
 
-### 1. Custom LZ4 Kernel with Extended Window (The Custom Kernel)
+O coração do sistema é um kernel LZ4 customizado, implementado em **OpenCL**, que supera as limitações da implementação padrão:
+*   **Janela de Match Estendida:** Utiliza *offsets* de 3 bytes, expandindo a janela de busca de *matches* para **16 MB** (contra 64 KB do LZ4 padrão). Isso melhora drasticamente a taxa de compressão para arquivos grandes e repetitivos.
+*   **Busca Top-K Adaptativa:** O algoritmo de busca de *matches* na tabela de *hash* utiliza uma técnica **Top-K** (configurável via `HASH_CANDIDATES`), que prioriza encontrar o melhor *match* possível, aumentando o *ratio* de compressão sem comprometer a velocidade devido ao paralelismo da GPU.
+*   **Otimização de Saída Antecipada (*Early-Exit*):** A lógica de compressão para de buscar *matches* melhores assim que encontra um com o comprimento definido por `GOOD_ENOUGH_MATCH`, equilibrando *ratio* e velocidade.
 
-The core compression logic is implemented in a custom OpenCL kernel (`lz4_compress_ext3.cl`). This kernel significantly enhances the standard LZ4 algorithm by utilizing **3-byte offsets**, which extends the maximum match distance (window size) to **16 MB** (compared to the standard LZ4's 64 KB limit). This modification drastically improves the compression ratio for large, repetitive data blocks, making it ideal for archival and backup scenarios.
+### 2. Deduplicação Inteligente de Múltiplos Estágios
 
-### 2. Parallel GPU Hashing for Deduplication
+Para minimizar o I/O e o custo computacional do *hashing* completo, o processo de deduplicação emprega um filtro de quatro estágios antes de calcular o *hash* completo na GPU:
+1.  **Filtro por Tamanho:** Agrupa arquivos pelo tamanho.
+2.  **Filtro 2 Bytes Iniciais:** Verifica os dois primeiros bytes.
+3.  **Filtro 2 Bytes Finais:** Verifica os dois últimos bytes.
+4.  **Filtro 3 Bytes Centrais:** Verifica três bytes ao redor do centro do arquivo.
 
-File deduplication is accelerated by calculating FNV-1a 64-bit hashes in parallel across multiple GPUs using OpenCL. The system employs a **round-robin strategy** to distribute the hashing workload, ensuring maximum throughput and minimizing CPU overhead during the most I/O-intensive phase.
+Somente os arquivos que passam por esses filtros rápidos (e baratos) são submetidos ao **cálculo de *hash* FNV-1a 64-bit paralelo na GPU**, garantindo que o motor de deduplicação seja excepcionalmente rápido e eficiente.
 
-### 3. Top-K Match Search Optimization
+### 3. Otimização de Buffer e Read-Ahead (I/O Assíncrono)
 
-Within the custom LZ4 kernel, the match-finding process uses a **Top-K adaptive search** (specifically, 8 candidates) in the hash table. This technique prioritizes finding the *best* possible match rather than just the first one, further enhancing the compression ratio without sacrificing performance due to the GPU's parallel processing capabilities.
+O sistema utiliza um motor de I/O assíncrono com *buffers* configuráveis (`READ_BUFFER_BATCHES` e `WRITE_BUFFER_BATCHES`) para desacoplar o processamento da GPU da latência do disco. Isso implementa um mecanismo de **Read-Ahead** (leitura antecipada) e **Write-Behind** (escrita atrasada), mantendo a GPU sempre alimentada com dados e o *throughput* de escrita constante.
 
-### 4. Extremely Efficient Multi-Stage Deduplication
+### 4. Auto-Skip Adaptativo (Otimização de Incompressibilidade)
 
-To minimize I/O and expensive full-file hash calculations, the deduplication process uses a highly efficient **four-stage filter** before performing the full GPU hash:
-1.  **Size Check:** Group files by size.
-2.  **First 2 Bytes Check:** Filter groups by the first two bytes.
-3.  **Last 2 Bytes Check:** Filter remaining groups by the last two bytes.
-4.  **Center 3 Bytes Check:** Filter by three bytes around the center of the file.
+O sistema incorpora uma otimização para dados incompressíveis. Se o tamanho do *frame* comprimido na GPU não for menor que o tamanho original, o sistema automaticamente armazena o *frame* em seu **formato RAW (não comprimido)**. Isso evita o desperdício de tempo de processamento e espaço de armazenamento em dados que não podem ser efetivamente comprimidos, atuando como um mecanismo de **"auto-skip"** para blocos incompressíveis.
 
-Only files that pass all these quick checks proceed to the final, full-file GPU hash calculation, making the deduplication process exceptionally fast.
+## ⚙️ Fluxo de Processamento Completo (Pipeline)
 
-### 5. Adaptive Compression Fallback (Read-Ahead Skip Optimization)
+O processo de compressão segue um pipeline de 8 estágios, projetado para máxima paralelização e eficiência:
 
-The system incorporates an optimization for handling incompressible data. While the compression is performed on the GPU, if the resulting compressed frame size is not smaller than the original data size, the system automatically falls back to storing the data in its **raw (uncompressed) format**. This prevents wasting time and space on data that cannot be effectively compressed, serving as an effective "read-ahead skip" mechanism for impossible-to-compress bytes.
+| Fase | Título | Descrição e Otimizações |
+| :--- | :--- | :--- |
+| **1** | **Scan Assíncrono & Metadata** | Traversal de diretório multi-threaded. Coleta metadados (timestamps, permissões, tamanho) e utiliza **Read-Ahead** para arquivos grandes. Emite *jobs* para a fila. |
+| **2** | **Motor de Chunking** | Segmentação de dados usando janela rolante (*rolling-window*). Suporte a janela estendida e heurísticas adaptativas para produzir blocos otimizados para deduplicação. |
+| **3** | **Deduplicação Multi-Nível** | Aplica o filtro de 4 estágios (Tamanho, 2 Bytes Iniciais, 2 Bytes Finais, 3 Bytes Centrais) seguido por **Hashing FNV-1a 64-bit paralelo na GPU**. Inclui **Auto-Skip** para dados repetitivos e rastreamento de referências. |
+| **4** | **Inicialização do Pipeline** | Ativação de *pools* de *workers* CPU/GPU baseada na configuração. Balanceamento de carga centralizado para a fila de blocos. |
+| **5** | **Estágio de Compressão** | **Caminho GPU:** Utiliza o kernel LZ4 personalizado (OpenCL) com busca Top-K e lógica de *early-exit*. **Caminho CPU:** Fallback otimizado para LZ4 em caso de indisponibilidade ou erro da GPU. |
+| **6** | **Montagem de Blocos** | Reordena os blocos processados em um fluxo de saída linear. Integra referências de deduplicação e anexa os resultados da compressão. |
+| **7** | **Mapeamento de Metadados** | Serializa o índice global (tabela de blocos, offsets, tamanhos originais, referências de *hash*). O índice é **comprimido com zlib**. |
+| **8** | **Escrita de Volumes & Footer** | Escreve o *payload* (blocos comprimidos) em volumes multi-parte (`.001`, `.002`, etc.). O índice comprimido é **embutido diretamente no último volume** do arquivo, com um *footer* fixo (`GPU_IDX1`) para localização rápida. |
 
-### 6. Embedded Metadata Indexing
+## 🛠️ Guia de Configuração (`config.txt`)
 
-The system generates a comprehensive index of all files, frames, and compression parameters. This index is then **compressed using zlib** and **embedded directly into the final volume file**. A fixed 24-byte footer (`GPU_IDX1`) is appended to the last volume, allowing a metadata reader to quickly locate and extract the index without relying on external index files.
+O arquivo `config.txt` centraliza todos os parâmetros de *tuning* para o sistema. Abaixo estão os itens essenciais e seus propósitos:
 
-## ⚙️ How It Works (Architecture Overview)
+### Compressão LZ4 GPU
 
+| Parâmetro | Descrição | Impacto |
+| :--- | :--- | :--- |
+| `FORCE_CPU_MODE` | Força o uso exclusivo da CPU, ignorando a GPU. | Debugging ou sistemas sem GPU. |
+| `COMPRESSOR_BATCH_SIZE` | Número de *frames* processados por vez na GPU. | **Performance:** Afeta o uso de VRAM e o *throughput* da GPU. |
+| `GPU_FALLBACK_ENABLED` | Habilita o *fallback* automático para CPU em caso de erro na GPU. | **Estabilidade:** Garante a conclusão do processo. |
+| `DECOMPRESSOR_BATCH_SIZE` | Número de *frames* por *batch* na descompressão. | **Performance:** Afeta o uso de VRAM na descompressão. |
+| `MAX_WORKER_THREADS` | Número de *threads* paralelas para descompressão. | **Paralelismo:** Equilíbrio entre paralelismo CPU-GPU e contenção de OpenCL. |
 
+### Otimização de I/O e Workers
 
-The compression process follows a streamlined, high-throughput pipeline:
+| Parâmetro | Descrição | Impacto |
+| :--- | :--- | :--- |
+| `READ_BUFFER_BATCHES` | Número de *batches* em *buffer* para **leitura antecipada (Read-Ahead)**. | **RAM/I/O:** Maior valor reduz espera por I/O de leitura, mas aumenta o uso de RAM. |
+| `WRITE_BUFFER_BATCHES` | Número de *batches* em *buffer* para **escrita atrasada (Write-Behind)**. | **RAM/I/O:** Maior valor reduz espera por I/O de escrita, mas aumenta o uso de RAM. |
+| `NUM_SCAN_WORKERS` | Número de *workers* paralelos para *scanning* de diretórios. | **Velocidade de Scan:** Acelera a fase inicial em HDDs grandes. |
+| `NUM_IO_WORKERS` | Número de *workers* I/O para leitura paralela de bytes (Fases de Deduplicação). | **Velocidade de Deduplicação:** Leitura paralela mais rápida durante filtros byte-a-byte. |
+| `NUM_READERS` | Número de *threads* de leitura para alimentar o *hash* GPU (Fase 5). | **Throughput GPU:** Mantém a GPU sempre ocupada, melhorando o *throughput*. |
+| `BUFFER_SIZE` | Tamanho do *buffer* da fila entre *readers* e GPU. | **Latência:** Maior *buffer* evita que a GPU fique ociosa esperando dados. |
 
-1.  **Directory Scan:** Recursively scan the source directory to create a list of `FileEntry` objects.
-2.  **Deduplication:** Apply the four-stage filter, followed by parallel GPU hashing to mark duplicate files.
-3.  **Frame Generation:** Unique files are concatenated into a single stream, which is then split into fixed-size frames (e.g., 16 MB).
-4.  **GPU Compression:** Frames are processed in parallel batches by multiple GPU workers using the custom LZ4 kernel.
-5.  **Volume Writing:** Compressed frames are written sequentially to multi-part volumes (`.001`, `.002`, etc.), respecting a maximum volume size.
-6.  **Index Embedding:** The final index is compressed and embedded into the last volume file.
+### Parâmetros Avançados do Kernel LZ4 (Tuning Fino)
 
-## 📊 Performance and Results
+Estes parâmetros controlam o comportamento do kernel OpenCL e afetam diretamente o *ratio* de compressão e a velocidade. **A alteração requer a recompilação do kernel OpenCL.**
 
-The use of the GPU provides notable performance gains:
+| Parâmetro | Descrição | Impacto no Ratio/Velocidade |
+| :--- | :--- | :--- |
+| `HASH_LOG` | Log2 do número de entradas base na tabela de *hash*. | **Ratio:** Maior valor = Mais memória GPU, melhor *ratio* para dados grandes. |
+| `HASH_CANDIDATES` | Número de posições candidatas por entrada de *hash* (**Top-K**). | **Ratio:** Maior valor = Melhor *ratio* (encontra *matches* mais longos), mas mais lento. |
+| `GOOD_ENOUGH_MATCH` | Comprimento de *match* considerado "bom o suficiente" para parar a busca. | **Velocidade:** Menor valor = Mais rápido (aceita *matches* curtos). Maior valor = Melhor *ratio*, mais lento. |
 
-*   **Deduplication:** GPU hashing drastically reduces CPU overhead for large folders.
-*   **Compression Speed:** GPU LZ4 can reach **2–3+ GB/s**, depending on the card.
-*   **Total Reduction:** The combination of Deduplication + LZ4 typically results in a **total reduction of 60–85%** in file size.
+## 📊 Performance e Resultados
 
-> **Example Output (Real Production Log):**
+A aceleração por GPU proporciona ganhos de desempenho significativos:
+
+*   **Velocidade de Compressão:** O LZ4 GPU pode atingir **2–3+ GB/s**, dependendo da placa.
+*   **Redução Total:** A combinação de Deduplicação + LZ4 resulta tipicamente em uma **redução total de 60–85%** no tamanho do arquivo.
+*   **Deduplicação:** O *hashing* paralelo na GPU reduz drasticamente a sobrecarga da CPU.
+
+> **Exemplo de Log de Produção:**
 >
 > ```
-> Dedup Final: Found 129 duplicates (586.13 MB saved)
-> Remaining size: 1.01 GB
-> 
-> GPU LZ4 Compression:
-> LZ_EXT3_GPU=46 (75.41%) | RAW=15 (24.59%)
-> Final: 971 MB → 240 MB (75.3% reduction)
+> [Dedup Final] Encontradas 1532 duplicatas reais.
+> [Dedup Final] Economia potencial: 50.35 MB
+>
+> [Compressor] | LZ_EXT3_GPU=32 (43.24%) | RAW=42 (56.76%) | Redução = 43.2%
+> Dados escritos:   1182.6 MB
+> Velocidade média: 110.8 MB/s
 > ```
 
-## 🛠️ Requirements
+## 🛠️ Requisitos e Uso
 
-To run the compressor, you will need:
+### Requisitos
 
 *   **Python 3.9+**
 *   **PyOpenCL**
 *   **Numpy**
 *   **LZ4**
-*   **Zlib** (usually built-in with Python)
-*   **Any CUDA/OpenCL compatible GPU**
-    *   *Recommended:* NVIDIA GTX 1050 Ti or better.
+*   **Zlib**
+*   **Qualquer GPU compatível com CUDA/OpenCL** (*Recomendado:* NVIDIA GTX 1050 Ti ou superior).
 
-## 🚀 Usage
-
-### 1. Installation
+### Instalação
 
 ```bash
-# Clone the repository
-git clone [YOUR_REPOSITORY_URL]
-cd [REPOSITORY_NAME]
+# Clone o repositório
+git clone https://github.com/danieldurio/CL_Compressor
+cd CL_Compressor
 
-# Install dependencies
+# Instale as dependências
 pip install pyopencl numpy lz4
 ```
 
-### 2. Compress a Directory
+### Compressão
 
-Use the main script `compressor_lz4_dedup.py`:
+Use o script principal `compressor_lz4_dedup.py`:
 
 ```bash
-python compressor_lz4_dedup.py <source_folder> -o <output_file_name>
+python compressor_lz4_dedup.py <pasta_origem> -o <nome_arquivo_saida>
+# Exemplo: python compressor_lz4_dedup.py /home/user/meus_arquivos -o backup_2025
+# Isso criará volumes como backup_2025.001, backup_2025.002, etc.
 ```
 
-*Example:*
-```bash
-python compressor_lz4_dedup.py /home/user/my_files -o backup_2025
-# This will create files like backup_2025.001, backup_2025.002, etc.
-```
+### Descompressão
 
-### 3. Decompress an Archive
-
-Use the `decompressor_lz4.py` script and point to the first volume (`.001`):
+Use o script `decompressor_lz4.py` apontando para o primeiro volume (`.001`):
 
 ```bash
-python decompressor_lz4.py <output_file.001> -o <destination_folder>
-```
-
-*Example:*
-```bash
-python decompressor_lz4.py backup_2025.001 -o /home/user/restoration
+python decompressor_lz4.py <arquivo_saida.001> -o <pasta_destino>
+# Exemplo: python decompressor_lz4.py backup_2025.001 -o /home/user/restauracao
 ```
 
 ## 🗺️ Roadmap
 
-The project is constantly evolving. Future plans include:
+O projeto está em constante evolução. Planos futuros incluem:
 
-*   Multi-GPU scaling.
-*   Streaming Compressor (`stdin`/`stdout` mode).
-*   Optional Zstd-GPU backend.
-*   Adaptive window sizes.
-*   Repair tool for missing volumes.
-
-## 🤝 Contributing
-
-Contributions, pull requests, issue reports, and suggestions are highly welcome! This is an experimental, research-oriented project, and your help is essential for continuous improvement.
+*   Escalabilidade Multi-GPU.
+*   Compressor de Streaming (`stdin`/`stdout`).
+*   Backend opcional Zstd-GPU.
+*   Tamanho de janela adaptativo.
+*   Ferramenta de reparo para volumes ausentes.
 
 ---
 
-## Real Console Output log Compress / Extract (Sample)
+## 🤝 Contribuições
 
-
-
-E:\TheStorage\runtime\compressor>python compressor_lz4_dedup.py E:\tmp -o E:\teste.gpu
-
-======================================================================
-
-COMPRESSOR LZ4 GPU + DEDUP
-
-======================================================================
-
-Fonte: E:\tmp
-
-Saída: E:\teste.gpu
-
-======================================================================
-
-Arquivos: 16496 (1292817530 bytes)
-
-
-[Fase 1] Deduplicação GPU...
-
-[Deduplicator] GPU Hashing ativado: NVIDIA GeForce GTX 1050 Ti
-
-[Deduplicator] Iniciando busca por duplicatas em 16496 arquivos...
-
-[Dedup Stage 1] Size Filter: 5176 grupos únicos. 13921 arquivos candidatos a duplicata.
-
-[Dedup Stage 2] First 2 Bytes: 2283 removidos. 11638 restantes.
-
-[Dedup Stage 3] Last 2 Bytes:  933 removidos. 10705 restantes.
-
-[Dedup Stage 4] Center 3 Bytes: 4841 removidos. 5864 restantes para Hash Completo.
-
-[Dedup Final] Encontradas 1532 duplicatas reais.
-
-[Dedup Final] Economia potencial: 50.35 MB
-
-[Dedup Final] Encontradas 1532 duplicatas reais.
-
-[Dedup Final] Economia potencial: 50.35 MB
-
-Tamanho efetivo: 1240023174 bytes
-
-Economia Dedup: 50.35 MB (4.1%)
-
-
-[Fase 2] Compressão LZ4 GPU...
-
-[Compressor] Parâmetros: frame_size=16MB, max_volume=98MB
-
-[Compressor] Detectadas 1 GPUs. Inicializando compressores...
-
-[GPU_LZ4] Compressor LZ4 OpenCL ativado em: NVIDIA GeForce GTX 1050 Ti (Index: 0)
-
-[GPU_LZ4] Buffers persistentes alocados: Input=16.0MB, Output=16.1MB, Hash=32768.0KB
-
-[Compressor] Iniciando compressão com 1 workers GPU...
-
-[LZ4] Frame 0 GPU1: 16777216 -> 12613956 (75.2%) | Economia: 4163260
-
-[VolumeWriter] Abrindo novo volume: E:\teste.gpu.001
-
-[VolumeWriter] Abrindo novo volume: E:\teste.gpu.002 | 519.9 MB/s
-
-[Compressor] | LZ_EXT3_GPU=5 (62.50%) | RAW=3 (37.50%) | Redução = 62.5%
-
-HIT: GPU1 = 8 | Tamanho real = 128MB | Tamanho atual = 48MB
-
-Last Frame - GPU1 = 7 | Progresso atual = 10.8%
-
-[VolumeWriter] Abrindo novo volume: E:\teste.gpu.003 | 1844.7 MB/s
-
-[Compressor] | LZ_EXT3_GPU=9 (64.29%) | RAW=5 (35.71%) | Redução = 64.3%
-
-HIT: GPU1 = 14 | Tamanho real = 224MB | Tamanho atual = 80MB
-
-Last Frame - GPU1 = 13 | Progresso atual = 18.9%
-
-[VolumeWriter] Abrindo novo volume: E:\teste.gpu.011 | 3063.4 MB/s
-
-[Compressor] | LZ_EXT3_GPU=22 (34.38%) | RAW=42 (65.62%) | Redução = 34.4%
-
-HIT: GPU1 = 64 | Tamanho real = 1024MB | Tamanho atual = 672MB
-
-Last Frame - GPU1 = 63 | Progresso atual = 86.6%
-
-[Compressor] | LZ_EXT3_GPU=32 (43.24%) | RAW=42 (56.76%) | Redução = 43.2%
-
-HIT: GPU1 = 74 | Tamanho real = 1183MB | Tamanho atual = 672MB
-
-Last Frame - GPU1 = 73 | Progresso atual = 100.0%
-
-[Index] Incorporando índice comprimido (148414 bytes) em teste.gpu.011...
-
-[Index] Footer gravado. Offset=89272883, Size=148414
-
-
-======================================================================
-
-✅ Processo Completo Finalizado!
-
-======================================================================
-
-
-
-
-
-
-E:\TheStorage\runtime\compressor>python decompressor_lz4.py E:\teste.gpu.001 -o e:\teste
-
-Volumes encontrados: 11. Último: teste.gpu.011
-
-Índice encontrado: Offset=89272883, Size=148414
-
-Índice carregado e descomprimido com sucesso.
-
-Restaurando 16496 arquivos para E:\teste...
-
-[GPU_LZ4] Decompressor OpenCL initialized on NVIDIA GeForce GTX 1050 Ti (Index: 0)
-
-
-[GPU_LZ4] GPU Decompressors initialized: 1
-
-[GPU_LZ4] Processing 74 frames in 4 batches (size=24)
-
-[GPU_LZ4] Worker threads: 2
-
-
-
-Criando 1532 arquivos duplicados (dedup reverso)...
-
-[Duplicatas] 1532/1532 arquivos duplicados recriados.
-
-
-
-============================================================
-
-Descompressão concluída!
-
-============================================================
-
-Tempo total:      100.0s
-
-Frames totais:    74
-
-  - GPU:          32 (43.2%)
-  - 
-  - CPU:          42 (56.8%)
-  - 
-Dados escritos:   1182.6 MB
-
-
-============================================================
+Contribuições, *pull requests*, relatórios de problemas e sugestões são muito bem-vindos! Este é um projeto experimental e orientado à pesquisa, e sua ajuda é essencial para a melhoria contínua.
