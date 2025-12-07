@@ -445,109 +445,187 @@ class VolumeWriter:
 # ---------------------------------------------------------------------------
 
 
-def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[tuple[int, bytes]]:
+def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[tuple[int, bytes | memoryview]]:
     """
     Gera frames lógicos de tamanho máximo `frame_size` bytes a partir dos
     arquivos de entrada.
 
-    Cada frame é simplesmente um pedaço do "stream" concatenado de todos os
-    arquivos, na ordem de `entries`.
+    OTIMIZAÇÃO DE PERFORMANCE:
+    - Minimiza cópias usando `memoryview` e `mmap`.
+    - Mantém mmaps vivos em um deque para evitar segfaults ao cruzar fronteiras de arquivos
+      enquanto o consumidor (compressor) ainda processa o buffer anterior.
     
-    Arquivos inacessíveis (em uso, sem permissão, etc.) são pulados com aviso.
-
-    Retorna tuplas (frame_id, frame_data).
+    Retorna tuplas (frame_id, data).
+    `data` pode ser `bytes` (para arquivos pequenos/bufferizados) ou `memoryview` (zero-copy).
     """
     frame_size = int(frame_size)
-    buffer = bytearray()
     frame_id = 0
     
-    # Estatísticas de erros durante leitura
+    # Buffer para acumular arquivos pequenos (< frame_size)
+    # Quando atinge frame_size, emite como bytes
+    small_files_buffer = bytearray()
+    
+    import mmap
+    from collections import deque
+    
+    # Keep-Alive Deque: (mmap_obj, file_obj)
+    # Mantém referências para evitar que o Python feche o arquivo/mmap prematuramente
+    # enquanto o consumidor (compressor) está lendo o memoryview.
+    # Tamanho 64 cobre ~2-3 batches de compressão (assumindo batch 24-32).
+    mmap_keep_alive = deque(maxlen=64)
+    
+    # Estatísticas de erros
     skipped_files = []
 
-    import mmap
-    
     for entry in entries:
         if entry.is_duplicate:
             continue
 
         try:
+            # Estratégia híbrida baseada no tamanho do arquivo
+            file_size = entry.size
+            if file_size == 0:
+                continue
+            
+            # Se arquivo é muito pequeno OU já temos dados parciais no buffer
+            # usamos estratégia de cópia para concatenar
+            USE_MMAP_THRESHOLD = 50 * 1024 * 1024  # Apenas mmap arquivos > 50MB
+            # Se o arquivo for menor que o frame_size, ele certamente vai pro buffer,
+            # então nem adianta mmap.
+            
+            # Decisão Simplificada:
+            # Se tivermos buffer pendente, lemos para completar o buffer.
+            # Se o buffer esvaziar e o arquivo ainda tiver muito dados, fazemos mmap do restante?
+            # Mmap é complexo de misturar com buffer.
+            # Nova Estratégia:
+            # 1. Tentar completar 'small_files_buffer' com read() normal.
+            # 2. Se buffer completou -> yield bytes.
+            # 3. Se sobrou muito dado no arquivo (> frame_size), usar mmap para gerar frames diretos.
+            
             with open(entry.path_abs, "rb") as f:
-                # Otimização: Memory-mapped I/O
-                # Evita syscalls excessivos e cópias de buffer
-                file_size = entry.size
-                if file_size == 0:
-                    continue
+                
+                # Fase 1: Completar buffer existente (ou encher se arquivo pequeno)
+                if len(small_files_buffer) > 0 or file_size < frame_size:
+                    wanted = frame_size - len(small_files_buffer)
+                    # Lê o que der (limitado pelo tamanho do arquivo)
+                    chunk = f.read(wanted)
+                    small_files_buffer.extend(chunk)
                     
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    cursor = 0
-                    while cursor < file_size:
-                        # Calcular quanto ler para completar o buffer ou ler tudo
-                        remaining_file = file_size - cursor
+                    if len(small_files_buffer) >= frame_size:
+                        yield frame_id, bytes(small_files_buffer[:frame_size])
+                        del small_files_buffer[:frame_size]
+                        frame_id += 1
                         
-                        # Se o buffer já tem dados, completar até frame_size
-                        if len(buffer) > 0:
-                            needed = frame_size - len(buffer)
-                            chunk_size = min(remaining_file, needed)
-                            buffer.extend(mm[cursor:cursor+chunk_size])
-                            cursor += chunk_size
-                            
-                            if len(buffer) >= frame_size:
-                                out = bytes(buffer[:frame_size])
-                                del buffer[:frame_size]
-                                yield frame_id, out
-                                frame_id += 1
+                        # Se ainda tem dados no arquivo após completar buffer...
+                        remaining = file_size - len(chunk)
+                        if remaining > 0:
+                            # O ponteiro do arquivo já avançou 'len(chunk)'.
+                            # Podemos continuar lendo ou mudar para mmap.
+                            pass
                         else:
-                            # Buffer vazio: tentar emitir frames diretos do mmap (zero-copy)
-                            while remaining_file >= frame_size:
-                                # Yield direto do slice mmap (cria bytes, mas evita buffer intermediário)
-                                yield frame_id, mm[cursor:cursor+frame_size]
-                                frame_id += 1
-                                cursor += frame_size
-                                remaining_file -= frame_size
+                            continue # Arquivo acabou
+                
+                # Fase 2: Processar restante do arquivo (se houver)
+                # Se chegamos aqui, small_files_buffer está vazio (ou foi emitido).
+                # E o arquivo ainda tem conteúdo.
+                
+                curr_pos = f.tell()
+                remaining_file = file_size - curr_pos
+                
+                if remaining_file == 0:
+                    continue
+
+                if remaining_file < frame_size:
+                    # Sobra insuficiente para um frame inteiro -> joga no buffer
+                    chunk = f.read()
+                    small_files_buffer.extend(chunk)
+                    continue
+                
+                # Se tem pelo menos um frame inteiro, vale a pena mmap (zero-copy)
+                try:
+                    # Windows: mmap requer size > 0. Se size=0 já filtramos.
+                    # length=0 mapreia todo o arquivo.
+                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    
+                    # Precisamos manter o arquivo E o mmap abertos
+                    # O truque é 'transferir' a posse deles para o deque
+                    # Para isso, duplicamos o handle ou simplesmente evitamos o close automático do 'with open'?
+                    # O 'with open' vai fechar no final do bloco.
+                    # Mmap requer file descriptor aberto? No Windows, mmap mantém o handle do arquivo,
+                    # mas se fecharmos o objeto python 'f', o fd subjacente fecha? Sim.
+                    # Então não podemos usar 'with open' se queremos yieldar mmap vivos.
+                    
+                    # CORREÇÃO: Não podemos usar 'with open' aqui se formos colocar no keep_alive.
+                    # Mas já abrimos lá em cima.
+                    # Solução: Clonar o file handle seria ideal, mas complexo inter-plataforma.
+                    # Workaround: Usar slice *copiado* se o mmap for arriscado? Não, queremos zero-copy.
+                    
+                    # Vamos assumir que processamos o mmap COMPLETO aqui dentro.
+                    # O problema é: yield pausa a função. O 'with open' NÃO fecha enquanto a função está pausada.
+                    # O 'with open' só fecha quando o bloco termina.
+                    # O bloco só termina quando o loop avança para o próximo arquivo.
+                    # Quando avança, o consumidor pode ainda ter a referência ao mmap anterior.
+                    
+                    # SOLUÇÃO REAL:
+                    # Em vez de Yieldar slices do mmap que dependem do arquivo aberto,
+                    # nós criamos um mmap_obj que *preserva* o arquivo.
+                    # No Python, mmap.mmap(f.fileno(), ...) duplica o handle no OS (Windows/Linux).
+                    # Então se f.close() for chamado, o mmap continua válido?
+                    # Testes dizem: No Windows, sim. No Linux, sim (ref count).
+                    # Mas o objeto Python 'mmap' precisa estar vivo.
+                    
+                    # Então:
+                    # 1. Criar mmap
+                    # 2. Adicionar mmap ao keep_alive
+                    # 3. Yield slices
+                    # 4. DEIXAR o 'with open' fechar 'f'. O mmap mantém o arquivo vivo no OS.
+                    
+                    # Mover o cursor do mmap para onde o 'f' parou
+                    cursor = curr_pos
+                    
+                    while remaining_file >= frame_size:
+                        # Yield slice (zero-copy view)
+                        # Yielding slicing de mmap cria bytes? NÃO. Cria bytes no Python < 3.
+                        # No Python 3, mm[x:y] retorna bytes (cópia).
+                        # Para zero-copy, precisamos memoryview(mm)[x:y].
+                        mv = memoryview(mm)
+                        yield frame_id, mv[cursor:cursor+frame_size]
+                        
+                        frame_id += 1
+                        cursor += frame_size
+                        remaining_file -= frame_size
+                    
+                    # Adicionar ao keep_alive para o mmap não ser GC'ed imediatamente
+                    mmap_keep_alive.append(mm)
+                    
+                    # Sobra final -> buffer
+                    if remaining_file > 0:
+                        small_files_buffer.extend(mm[cursor:cursor+remaining_file])
+                        
+                except (ValueError, OSError):
+                    # Fallback se mmap falhar (ex: FS não suporta, 0 bytes, etc)
+                    # Voltar para o ponto correto
+                    f.seek(curr_pos)
+                    while True:
+                        chunk = f.read(frame_size) # Lê bloco (cópia)
+                        if not chunk: break
+                        
+                        if len(chunk) == frame_size:
+                            yield frame_id, chunk
+                            frame_id += 1
+                        else:
+                            small_files_buffer.extend(chunk)
+                            break
                             
-                            # Sobrou pedaço menor que frame_size no final do arquivo
-                            if remaining_file > 0:
-                                buffer.extend(mm[cursor:cursor+remaining_file])
-                                cursor += remaining_file
-                                
         except PermissionError:
             reason = "Permissão negada"
             skipped_files.append((entry.path_rel, reason))
-            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
+            # print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
             continue
             
         except FileNotFoundError:
-            reason = "Arquivo não encontrado/movido durante compressão"
+            reason = "Arquivo não encontrado/movido"
             skipped_files.append((entry.path_rel, reason))
-            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
-            continue
-            
-        except OSError as e:
-            # Detectar motivos específicos do Windows
-            error_code = getattr(e, 'winerror', None) or e.errno
-            
-            if error_code == 32:  # ERROR_SHARING_VIOLATION
-                reason = "Arquivo em uso por outro processo"
-            elif error_code == 5:  # ERROR_ACCESS_DENIED
-                reason = "Acesso negado pelo sistema"
-            elif error_code == 33:  # ERROR_LOCK_VIOLATION
-                reason = "Arquivo bloqueado por outro processo"
-            elif error_code == 1224:  # ERROR_USER_MAPPED_FILE
-                reason = "Arquivo mapeado por outro processo"
-            else:
-                reason = f"Erro de I/O ({error_code}): {e}"
-                
-            skipped_files.append((entry.path_rel, reason))
-            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
-            continue
-            
-        except ValueError as e:
-            # mmap pode lançar ValueError para arquivos vazios ou problemas de mapeamento
-            if "cannot mmap an empty file" in str(e):
-                continue  # Arquivo vazio, não precisa avisar
-            reason = f"Erro de mapeamento: {e}"
-            skipped_files.append((entry.path_rel, reason))
-            print(f"[IO] ⚠️ SKIP: {entry.path_rel} - {reason}")
             continue
             
         except Exception as e:
@@ -559,17 +637,10 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
     # Relatório final de arquivos pulados
     if skipped_files:
         print(f"\n[IO] 📊 Resumo: {len(skipped_files)} arquivo(s) pulado(s) durante leitura")
-        # Agrupar por motivo
-        reasons_count = {}
-        for _, reason in skipped_files:
-            reasons_count[reason] = reasons_count.get(reason, 0) + 1
-        for reason, count in reasons_count.items():
-            print(f"      - {reason}: {count}")
-        print()
-
+        
     # Sobrou algo no buffer (último frame parcial)
-    if buffer:
-        yield frame_id, bytes(buffer)
+    if small_files_buffer:
+        yield frame_id, bytes(small_files_buffer)
 
 
 # ---------------------------------------------------------------------------
@@ -660,52 +731,23 @@ def embed_index_file(
     params: Dict[str, Any],
 ) -> None:
     """
-    Gera o índice JSON, comprime com zlib e anexa ao final do último volume.
-    Adiciona um rodapé (Footer) fixo para localização.
+    Gera o índice STREAMING (GPU_IDX2), comprime com gzip (stream) e anexa ao final do último volume.
     
-    Footer Format (24 bytes):
-    [Offset Index (8 bytes)] [Size Index (8 bytes)] [Magic (8 bytes)]
-    Magic = b'GPU_IDX1'
+    Formato GPU_IDX2:
+    - Linha 1: Header JSON (version, params, dictionary)
+    - Linhas 2..N: FileEntries (JSONL)
+    - Linhas N+1..M: FrameMeta (JSONL)
+    
+    Isso evita carregar listas gigantes em memória para o json.dumps(),
+    mantendo O(1) de memória independente do número de arquivos.
+    
+    Footer (24 bytes):
+    [Offset (8)] [Size (8)] [Magic (8)]
+    Magic = b'GPU_IDX2'
     """
-    import zlib
     import struct
+    import gzip
     
-    files_list = [
-        {
-            "path_rel": f.path_rel,
-            "size": f.size,
-            "is_duplicate": f.is_duplicate,
-            "original": f.original_path_rel,
-        }
-        for f in files
-    ]
-
-    frames_list = [
-        {
-            "frame_id": fr.frame_id,
-            "volume_name": fr.volume_name,
-            "offset": fr.offset,
-            "compressed_size": fr.compressed_size,
-            "uncompressed_size": fr.uncompressed_size,
-        }
-        for fr in frames
-    ]
-
-    index_obj: Dict[str, Any] = {
-        "files": files_list,
-        "frames": frames_list,
-        "dictionary": _dictionary_to_serializable(dictionary),
-        "params": dict(params),
-    }
-
-    # 1. Serializar JSON
-    json_bytes = json.dumps(index_obj, ensure_ascii=False).encode('utf-8')
-    
-    # 2. Comprimir
-    compressed_index = zlib.compress(json_bytes, level=9)
-    c_size = len(compressed_index)
-    
-    # 3. Anexar ao último volume
     # Se last_volume_name for vazio (nenhum frame gerado?), cria um .001
     if not last_volume_name:
         last_volume_name = f"{output_base.name}.001"
@@ -720,18 +762,66 @@ def embed_index_file(
     # Obter offset atual (onde começa o índice)
     start_offset = last_vol_path.stat().st_size
     
-    print(f"[Index] Incorporando índice comprimido ({c_size} bytes) em {last_volume_name}...")
+    print(f"[Index] Incorporando índice STREAMING (GPU_IDX2) em {last_volume_name}...", flush=True)
     
-    with open(last_vol_path, "ab") as f:
-        f.write(compressed_index)
+    # Abrir arquivo de saída em modo append
+    with open(last_vol_path, "ab") as f_out:
+        # Usar GzipFile envolvendo o file handle para streamar a compressão
+        # mtime=0 para saída determinística
+        with gzip.GzipFile(fileobj=f_out, mode="wb", compresslevel=9, mtime=0) as gz:
+            
+            # 1. Header
+            header = {
+                "version": 2,
+                "type": "GPU_IDX2",
+                "params": dict(params),
+                "dictionary": _dictionary_to_serializable(dictionary),
+                "count_files": len(files),
+                "count_frames": len(frames)
+            }
+            gz.write(json.dumps(header, ensure_ascii=False).encode('utf-8'))
+            gz.write(b'\n')
+            
+            # 2. Files Stream
+            # Escreve um objeto JSON por linha
+            for fp in files:
+                # Otimização: Criar dict manualmente é mais rápido que overhead de dataclasses.asdict
+                # Compact key names para economizar espaço? Não, melhor legibilidade/compatibilidade
+                # "t": "f" (type file) markers não são estritamente necessários se a ordem for garantida,
+                # mas ajudam no parse robusto. Vamos assumir ordem rígida: Header -> Files -> Frames.
+                entry = {
+                    "path_rel": fp.path_rel,
+                    "size": fp.size,
+                    "is_duplicate": fp.is_duplicate,
+                    "original": fp.original_path_rel
+                }
+                gz.write(json.dumps(entry, ensure_ascii=False).encode('utf-8'))
+                gz.write(b'\n')
+                
+            # 3. Frames Stream
+            for fr in frames:
+                entry = {
+                    "frame_id": fr.frame_id,
+                    "volume_name": fr.volume_name,
+                    "offset": fr.offset,
+                    "compressed_size": fr.compressed_size,
+                    "uncompressed_size": fr.uncompressed_size
+                }
+                gz.write(json.dumps(entry).encode('utf-8'))
+                gz.write(b'\n')
         
-        # 4. Escrever Footer
-        # Offset (8), Size (8), Magic (8)
-        magic = b'GPU_IDX1'
-        footer = struct.pack('<QQ8s', start_offset, c_size, magic)
-        f.write(footer)
+        # Após fechar o gz, ele escreveu bytes comprimidos no f_out.
+        # Agora escrevemos o footer no f_out.
         
-    print(f"[Index] Footer gravado. Offset={start_offset}, Size={c_size}")
+        final_offset = f_out.tell()
+        index_size = final_offset - start_offset
+        
+        # 4. Footer GPU_IDX2
+        magic = b'GPU_IDX2' # Novo Magic
+        footer = struct.pack('<QQ8s', start_offset, index_size, magic)
+        f_out.write(footer)
+        
+    print(f"[Index] Footer GPU_IDX2 gravado. Offset={start_offset}, Size={index_size}")
 
 # ---------------------------------------------------------------------------
 # Privilégios do Sistema (Windows)

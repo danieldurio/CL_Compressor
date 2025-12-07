@@ -81,16 +81,54 @@ def read_archive_index(archive_path: Path) -> Optional[Dict[str, Any]]:
             
             offset, size, magic = struct.unpack('<QQ8s', footer)
             
-            if magic != b'GPU_IDX1':
+            offset, size, magic = struct.unpack('<QQ8s', footer)
+            
+            if magic == b'GPU_IDX1':
+                f.seek(offset)
+                compressed_index = f.read(size)
+                index_bytes = zlib.decompress(compressed_index)
+                index = json.loads(index_bytes.decode('utf-8'))
+                
+            elif magic == b'GPU_IDX2':
+                # Streaming Read (GPU_IDX2)
+                import gzip
+                import io
+                
+                f.seek(offset)
+                compressed_bytes = f.read(size)
+                
+                with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes), mode='rb') as gz:
+                    # 1. Header
+                    line = gz.readline()
+                    header = json.loads(line.decode('utf-8'))
+                    params = header["params"]
+                    count_files = header.get("count_files", 0)
+                    count_frames = header.get("count_frames", 0)
+                    
+                    files = []
+                    # 2. Files Stream
+                    for _ in range(count_files):
+                        line = gz.readline()
+                        if not line: break
+                        files.append(json.loads(line.decode('utf-8')))
+                        
+                    frames = []
+                    # 3. Frames Stream
+                    for _ in range(count_frames):
+                        line = gz.readline()
+                        if not line: break
+                        frames.append(json.loads(line.decode('utf-8')))
+                        
+                index = {
+                    "files": files,
+                    "frames": frames,
+                    "params": params,
+                    "dictionary": header.get("dictionary")
+                }
+            else:
                 print(f"Erro: Assinatura inválida: {magic}")
                 return None
             
-            f.seek(offset)
-            compressed_index = f.read(size)
-            
-        index_bytes = zlib.decompress(compressed_index)
-        index = json.loads(index_bytes.decode('utf-8'))
-        
         # Adicionar metadados úteis
         index['_archive_path'] = str(archive_path)
         index['_volumes'] = [str(v) for v in volumes_files]
@@ -100,6 +138,8 @@ def read_archive_index(archive_path: Path) -> Optional[Dict[str, Any]]:
         
     except Exception as e:
         print(f"Erro ao ler índice: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 

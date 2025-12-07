@@ -55,20 +55,56 @@ def read_footer(archive_path: Path) -> Optional[Dict[str, Any]]:
             # Decodificar footer
             offset, size, magic = struct.unpack('<QQ8s', footer)
             
-            if magic != b'GPU_IDX1':
+            if magic == b'GPU_IDX1':
+                print(f"✓ Footer encontrado (Legacy): Offset={offset}, Size={size} bytes")
+                # Ler índice comprimido
+                f.seek(offset)
+                compressed_index = f.read(size)
+                
+                # Descomprimir índice
+                index_bytes = zlib.decompress(compressed_index)
+                index = json.loads(index_bytes.decode('utf-8'))
+                
+            elif magic == b'GPU_IDX2':
+                print(f"✓ Footer encontrado (Streaming): Offset={offset}, Size={size} bytes")
+                
+                import gzip
+                import io
+                
+                f.seek(offset)
+                compressed_bytes = f.read(size)
+                
+                with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes), mode='rb') as gz:
+                    # 1. Header
+                    line = gz.readline()
+                    header = json.loads(line.decode('utf-8'))
+                    params = header["params"]
+                    count_files = header.get("count_files", 0)
+                    count_frames = header.get("count_frames", 0)
+                    
+                    files = []
+                    # 2. Files Stream
+                    for _ in range(count_files):
+                        line = gz.readline()
+                        if not line: break
+                        files.append(json.loads(line.decode('utf-8')))
+                        
+                    frames = []
+                    # 3. Frames Stream
+                    for _ in range(count_frames):
+                        line = gz.readline()
+                        if not line: break
+                        frames.append(json.loads(line.decode('utf-8')))
+                
+                index = {
+                    "files": files,
+                    "frames": frames,
+                    "params": params
+                }
+            else:
                 print(f"Erro: Assinatura inválida no footer: {magic}")
                 print("Este arquivo pode não ser um arquivo compactado válido.")
                 return None
-            
-            print(f"✓ Footer encontrado: Offset={offset}, Size={size} bytes")
-            
-            # Ler índice comprimido
-            f.seek(offset)
-            compressed_index = f.read(size)
-            
-            # Descomprimir índice
-            index_bytes = zlib.decompress(compressed_index)
-            index = json.loads(index_bytes.decode('utf-8'))
             
             print(f"✓ Índice carregado: {len(index.get('files', []))} arquivos, {len(index.get('frames', []))} frames")
             
@@ -76,6 +112,8 @@ def read_footer(archive_path: Path) -> Optional[Dict[str, Any]]:
             
     except Exception as e:
         print(f"Erro ao ler footer: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 

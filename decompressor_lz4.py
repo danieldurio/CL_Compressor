@@ -454,27 +454,78 @@ def main() -> int:
         
         offset, size, magic = struct.unpack('<QQ8s', footer)
         
-        if magic != b'GPU_IDX1':
+        if magic == b'GPU_IDX1':
+            print(f"Índice encontrado (Legacy GPU_IDX1): Offset={offset}, Size={size}")
+            f.seek(offset)
+            compressed_index = f.read(size)
+            try:
+                index_bytes = zlib.decompress(compressed_index)
+                index = json.loads(index_bytes.decode('utf-8'))
+                files = index["files"]
+                frames = index["frames"]
+                params = index["params"]
+                print("Índice carregado e descomprimido com sucesso.")
+            except Exception as e:
+                print(f"Erro ao descomprimir/ler índice: {e}")
+                return 1
+
+        elif magic == b'GPU_IDX2':
+            print(f"Índice encontrado (Streaming GPU_IDX2): Offset={offset}, Size={size}")
+            
+            # Streaming Read
+            # Requer gzip wrap no file handle
+            import gzip
+            import io
+            
+            f.seek(offset)
+            compressed_bytes = f.read(size)
+            
+            try:
+                # Ler stream linha a linha
+                # Precisamos ler tudo para memória pois o resto do código espera listas completas
+                # (Para suportar restauração 100% streaming sem carregar listas, precisaria refatorar tudo)
+                # Por enquanto, carregamos as listas aqui, mas evitando o pico de memória do zlib.decompress() monolítico.
+                
+                # Fazer wrap com gzip usando BytesIO para evitar ler o footer
+                with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes), mode='rb') as gz:
+                    # Leitor de linhas bufferizado
+                    # 1. Header
+                    line = gz.readline()
+                    header = json.loads(line.decode('utf-8'))
+                    params = header["params"] # header["dictionary"] também existe mas não usamos explicitamente aqui
+                    count_files = header.get("count_files", 0)
+                    count_frames = header.get("count_frames", 0)
+                    
+                    print(f"Header lido: {count_files} arquivos, {count_frames} frames.")
+                    
+                    files = []
+                    frames = []
+                    
+                    # 2. Files Stream
+                    print("Carregando lista de arquivos...")
+                    for _ in range(count_files):
+                        line = gz.readline()
+                        if not line: break
+                        files.append(json.loads(line.decode('utf-8')))
+                        
+                    # 3. Frames Stream
+                    print("Carregando lista de frames...")
+                    for _ in range(count_frames):
+                        line = gz.readline()
+                        if not line: break
+                        frames.append(json.loads(line.decode('utf-8')))
+                        
+                print("Índice streaming carregado com sucesso.")
+
+            except Exception as e:
+                print(f"Erro ao ler índice streaming: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
+        
+        else:
             print(f"Erro: Assinatura inválida no footer: {magic}")
             return 1
-            
-        print(f"Índice encontrado: Offset={offset}, Size={size}")
-        
-        f.seek(offset)
-        compressed_index = f.read(size)
-        
-    try:
-        index_bytes = zlib.decompress(compressed_index)
-        index = json.loads(index_bytes.decode('utf-8'))
-        print("Índice carregado e descomprimido com sucesso.")
-    except Exception as e:
-        print(f"Erro ao descomprimir/ler índice: {e}")
-        return 1
-        
-    # Carregar metadados
-    files = index["files"]
-    frames = index["frames"]
-    params = index["params"]
     
     # Mapa de frames por ID
     frames_map = {f["frame_id"]: f for f in frames}

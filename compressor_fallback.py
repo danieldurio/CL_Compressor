@@ -25,6 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional
 import numpy as np
+import threading
 
 # Tentar importar Numba para JIT compilation
 NUMBA_AVAILABLE = False
@@ -297,6 +298,9 @@ def _compress_core_jit(
     return op
 
 
+# Thread-local storage for buffers
+_thread_local = threading.local()
+
 def compress_lz4_ext3(data: bytes) -> bytes:
     """
     Comprime dados usando LZ4 ext3 (3-byte offsets, 16MB window).
@@ -304,25 +308,39 @@ def compress_lz4_ext3(data: bytes) -> bytes:
     
     Usa versão JIT otimizada se Numba disponível.
     
-    Args:
-        data: Dados a comprimir
-        
-    Returns:
-        Dados comprimidos ou dados originais se incompressíveis
+    OTIMIZAÇÃO: Reutiliza buffers por thread (output e hash table)
+    para evitar alocação excessiva de memória (malloc churn).
     """
     input_size = len(data)
     if input_size < 13:
         return data
     
-    # Converter para numpy arrays
+    # Converter para numpy arrays (zero-copy frombuffer se possível, mas bytes é imutável, então cria read-only array?
+    # np.frombuffer cria array que aponta para a memória dos bytes. Seguro para leitura.)
     data_arr = np.frombuffer(data, dtype=np.uint8)
     
-    # Output buffer
+    # Calcular tamanho máximo de saída
     max_output_size = input_size + (input_size // 255) + 128
-    output_arr = np.zeros(max_output_size, dtype=np.uint8)
+    
+    # Obter buffers thread-local
+    if not hasattr(_thread_local, 'output_buffer') or len(_thread_local.output_buffer) < max_output_size:
+        # Alocar novo buffer se não existir ou for pequeno
+        # Alocamos com folga para evitar realocações frequentes em variações pequenas
+        alloc_size = max(max_output_size, 16 * 1024 * 1024) # Mínimo 16MB
+        _thread_local.output_buffer = np.zeros(alloc_size, dtype=np.uint8)
+    
+    output_arr = _thread_local.output_buffer
     
     # Hash table como numpy array 2D [HASH_ENTRIES, HASH_CANDIDATES]
-    hash_table = np.zeros((HASH_ENTRIES, HASH_CANDIDATES), dtype=np.uint32)
+    # Tamanho fixo (4MB), então alocamos uma vez por thread
+    if not hasattr(_thread_local, 'hash_table'):
+        _thread_local.hash_table = np.zeros((HASH_ENTRIES, HASH_CANDIDATES), dtype=np.uint32)
+    else:
+        # Precisamos limpar a hash table entre compressões independentes
+        # .fill(0) é rápido
+        _thread_local.hash_table.fill(0)
+        
+    hash_table = _thread_local.hash_table
     
     # Executar compressão JIT
     result_size = _compress_core_jit(data_arr, output_arr, hash_table)
@@ -330,6 +348,8 @@ def compress_lz4_ext3(data: bytes) -> bytes:
     if result_size < 0:
         return data  # Incompressível
     
+    # Retorna bytes copiados do buffer (slice cria cópia ao converter para bytes)
+    # Importante: o buffer continua vivo na thread para próxima chamada
     return bytes(output_arr[:result_size])
 
 
