@@ -2,11 +2,13 @@
 
 ### Imagens ilustrativas do CL_Compressor
 
-![Imagem 1 — exemplo de dado / interface ou output](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/1.png)
+![Imagem 1 Main](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/1.png)
 
-![Imagem 2 — compressão / deduplicação / desempenho](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/2.png)
+![Imagem 2 Compress](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/2.png)
 
-![Imagem 3 — estrutura de volumes / index / footer / output final](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/3.png)
+![Imagem 3 Config](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/3.png)
+
+![Imagem 4 WEB](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/4.jpg)
 
 
 
