@@ -21,6 +21,7 @@ import zlib
 import lz4.block # Mudança aqui: frame -> block
 import time
 import threading
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from decompressor_lz4_ext3 import decompress_lz4_ext3
 try:
@@ -410,14 +411,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Descompressor LZ4 GPU (Embedded Index)")
     parser.add_argument("archive_base", help="Caminho de qualquer volume (ex: F:\\saida_final.001)")
     parser.add_argument("-o", "--output", required=True, help="Pasta de destino")
-    parser.add_argument("--acls", action="store_true", help="Restaurar ACLs/Atributos se disponível (arquivo .acls)")
+    parser.add_argument("--acls", action="store_true", help="Restaurar ACLs de arquivo .acls externo (legado GPU_IDX1/2)")
     
     args = parser.parse_args()
     
-    output_dir = Path(args.output).resolve()
+    import pathlib
+    output_dir = pathlib.Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    base_path = Path(args.archive_base).resolve()
+    base_path = pathlib.Path(args.archive_base).resolve()
     parent_dir = base_path.parent
     name_stem = base_path.name
     
@@ -472,8 +474,6 @@ def main() -> int:
         elif magic == b'GPU_IDX2':
             print(f"Índice encontrado (Streaming GPU_IDX2): Offset={offset}, Size={size}")
             
-            # Streaming Read
-            # Requer gzip wrap no file handle
             import gzip
             import io
             
@@ -481,18 +481,11 @@ def main() -> int:
             compressed_bytes = f.read(size)
             
             try:
-                # Ler stream linha a linha
-                # Precisamos ler tudo para memória pois o resto do código espera listas completas
-                # (Para suportar restauração 100% streaming sem carregar listas, precisaria refatorar tudo)
-                # Por enquanto, carregamos as listas aqui, mas evitando o pico de memória do zlib.decompress() monolítico.
-                
-                # Fazer wrap com gzip usando BytesIO para evitar ler o footer
                 with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes), mode='rb') as gz:
-                    # Leitor de linhas bufferizado
                     # 1. Header
                     line = gz.readline()
                     header = json.loads(line.decode('utf-8'))
-                    params = header["params"] # header["dictionary"] também existe mas não usamos explicitamente aqui
+                    params = header["params"]
                     count_files = header.get("count_files", 0)
                     count_frames = header.get("count_frames", 0)
                     
@@ -501,14 +494,12 @@ def main() -> int:
                     files = []
                     frames = []
                     
-                    # 2. Files Stream
                     print("Carregando lista de arquivos...")
                     for _ in range(count_files):
                         line = gz.readline()
                         if not line: break
                         files.append(json.loads(line.decode('utf-8')))
                         
-                    # 3. Frames Stream
                     print("Carregando lista de frames...")
                     for _ in range(count_frames):
                         line = gz.readline()
@@ -519,9 +510,108 @@ def main() -> int:
 
             except Exception as e:
                 print(f"Erro ao ler índice streaming: {e}")
+                return 1
+
+        elif magic == b'GPU_IDX3':
+            print(f"Índice encontrado (SQLite GPU_IDX3): Offset={offset}, Size={size}")
+            import sqlite3
+            import shutil
+            import gzip
+            import time
+            import io
+            from pathlib import Path
+            
+            f.seek(offset)
+            compressed_bytes = f.read(size)
+            
+            # Setup temp db path
+            tmp_db_dir = Path("tmp").resolve()
+            tmp_db_dir.mkdir(parents=True, exist_ok=True)
+            tmp_db_path = tmp_db_dir / f"index_read_{int(time.time())}_{offset}.db"
+            
+            try:
+                # Extract DB
+                with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes), mode='rb') as gz:
+                    with open(tmp_db_path, "wb") as db_out:
+                        shutil.copyfileobj(gz, db_out)
+                
+                # Connect and Query
+                conn = sqlite3.connect(tmp_db_path)
+                c = conn.cursor()
+                
+                # 1. Params & Dictionary
+                params = {}
+                try:
+                    c.execute("SELECT value FROM kv_store WHERE key='params'")
+                    row = c.fetchone()
+                    if row: params = json.loads(row[0])
+                except: pass
+                
+                # 2. Files
+                print("Carregando lista de arquivos do SQLite...")
+                # JOIN sddls to get text
+                c.execute("""
+                    SELECT f.path_rel, f.size, f.is_duplicate, f.original_path, 
+                           f.attrs, f.ctime, f.mtime, f.atime, s.sddl
+                    FROM files f
+                    LEFT JOIN sddls s ON f.sddl_id = s.id
+                    ORDER BY f.id
+                """)
+                
+                files = []
+                for r in c.fetchall():
+                    path_rel_str = r[0]
+                    original_path_str = r[3]
+
+                    # Sanitize paths to be relative
+                    if path_rel_str:
+                        p = Path(path_rel_str)
+                        if p.is_absolute():
+                            path_rel_str = str(p.relative_to(p.anchor))
+                    
+                    if original_path_str:
+                        p_orig = Path(original_path_str)
+                        if p_orig.is_absolute():
+                            original_path_str = str(p_orig.relative_to(p_orig.anchor))
+
+                    files.append({
+                        "path_rel": path_rel_str,
+                        "size": r[1] if r[1] is not None else 0,
+                        "is_duplicate": bool(r[2]),
+                        "original": original_path_str,
+                        "attrs": r[4],
+                        "ctime": r[5],
+                        "mtime": r[6],
+                        "atime": r[7],
+                        "sddl": r[8]
+                    })
+                
+                # 3. Frames
+                print("Carregando lista de frames do SQLite...")
+                c.execute("SELECT id, vol, offset, size, original_size FROM frames ORDER BY id")
+                frames = []
+                for r in c.fetchall():
+                    frames.append({
+                        "frame_id": r[0],
+                        "volume_name": r[1],
+                        "offset": r[2],
+                        "compressed_size": r[3],
+                        "uncompressed_size": r[4]
+                    })
+                    
+                conn.close()
+                print(f"Índice SQLite carregado: {len(files)} arquivos, {len(frames)} frames.")
+                
+            except Exception as e:
+                print(f"Erro ao ler índice SQLite: {e}")
                 import traceback
                 traceback.print_exc()
                 return 1
+            finally:
+                if tmp_db_path.exists():
+                    try:
+                        tmp_db_path.unlink()
+                    except: pass
         
         else:
             print(f"Erro: Assinatura inválida no footer: {magic}")
@@ -574,7 +664,9 @@ def main() -> int:
                     current_file_pos = 0
                     continue
                 
-                remaining = curr_file_entry["size"] - current_file_pos
+                f_size = curr_file_entry.get("size")
+                if f_size is None: f_size = 0
+                remaining = f_size - current_file_pos
                 if remaining > 0:
                     break
                 
@@ -619,7 +711,7 @@ def main() -> int:
                 
                 curr_fp = open(p, "wb")
             
-            remaining = curr_file_entry["size"] - current_file_pos
+            remaining = (curr_file_entry.get("size") or 0) - current_file_pos
             chunk_size = min(data_len - data_pos, remaining)
             
             curr_fp.write(data[data_pos : data_pos + chunk_size])
@@ -627,7 +719,7 @@ def main() -> int:
             current_file_pos += chunk_size
             data_pos += chunk_size
             
-            if current_file_pos >= curr_file_entry["size"]:
+            if current_file_pos >= (curr_file_entry.get("size") or 0):
                 curr_fp.close()
                 curr_fp = None
                 current_file_idx += 1
@@ -814,6 +906,34 @@ def main() -> int:
     if duplicates:
         print(f"\nCriando {len(duplicates)} arquivos duplicados (dedup reverso)...")
         created = 0
+        failed = 0
+        missing_originals = []
+        
+        import os
+
+        # Detectar prefixo comum (pasta raiz do backup)
+        # Estratégia: extrair o primeiro componente do path_rel da duplicata
+        # Ex: dup_path = "sonarqube-25.7.0.110598\data\es8\..."
+        #     orig_path = "data\es8\..."
+        # Primeiro componente de dup: "sonarqube-25.7.0.110598"
+        # Se orig NÃO começa com esse componente, então é o prefixo raiz
+        root_prefix = None
+        if duplicates:
+            first_dup = duplicates[0]
+            dup_path = first_dup.get("path_rel", "").replace('/', os.sep).replace('\\', os.sep)
+            orig_path = first_dup.get("original", "").replace('/', os.sep).replace('\\', os.sep)
+            
+            if dup_path and orig_path:
+                # Extrair primeiro componente do dup_path
+                parts = dup_path.split(os.sep)
+                if len(parts) > 1:
+                    first_component = parts[0]
+                    
+                    # Verificar se o original NÃO começa com esse componente
+                    orig_parts = orig_path.split(os.sep)
+                    if orig_parts and orig_parts[0] != first_component:
+                        root_prefix = first_component + os.sep
+                        print(f"[Duplicatas] Prefixo raiz detectado: '{root_prefix}'")
 
         for dup in duplicates:
             dup_rel = dup.get("path_rel")
@@ -822,19 +942,43 @@ def main() -> int:
             if not dup_rel or not orig_rel:
                 # Entrada estranha/incompleta, pula
                 print(f"[AVISO] Entrada duplicada sem 'path_rel' ou 'original': {dup}")
+                failed += 1
                 continue
 
-            src_path = output_dir / orig_rel
-            dst_path = output_dir / dup_rel
+            # Normalizar caminhos (converter barras para o formato do SO)
+            dup_rel_normalized = dup_rel.replace('/', os.sep).replace('\\', os.sep)
+            orig_rel_normalized = orig_rel.replace('/', os.sep).replace('\\', os.sep)
+
+            dst_path = output_dir / dup_rel_normalized
+            
+            # Tentar várias estratégias para encontrar o arquivo original
+            src_path = None
+            candidates = [
+                output_dir / orig_rel_normalized,  # Caminho direto normalizado
+                output_dir / orig_rel,             # Caminho direto sem normalização
+            ]
+            
+            # Se detectamos um prefixo raiz, adicionar como candidato
+            if root_prefix:
+                candidates.insert(0, output_dir / (root_prefix + orig_rel_normalized))
+            
+            for candidate in candidates:
+                if candidate.exists():
+                    src_path = candidate
+                    break
 
             try:
+                if not src_path:
+                    missing_originals.append((dup_rel_normalized, orig_rel_normalized))
+                    failed += 1
+                    continue
+
                 # Garante que a pasta do destino exista
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Tenta criar hardlink (mais leve em disco).
                 # Se não funcionar (SO, permissões, volumes diferentes), cai pra cópia.
                 try:
-                    import os
                     if dst_path.exists():
                         dst_path.unlink()
                     os.link(src_path, dst_path)
@@ -843,7 +987,17 @@ def main() -> int:
 
                 created += 1
             except Exception as e:
-                print(f"[ERRO] Falha ao criar duplicata '{dup_rel}' a partir de '{orig_rel}': {e}")
+                print(f"[ERRO] Falha ao criar duplicata '{dup_rel_normalized}' a partir de '{orig_rel_normalized}': {e}")
+                failed += 1
+        
+        # Resumo de arquivos originais não encontrados
+        if missing_originals:
+            print(f"\n[AVISO] {len(missing_originals)} arquivo(s) original(is) não encontrado(s):")
+            # Mostrar apenas os primeiros 5 para não poluir o console
+            for i, (dup_path, orig_path) in enumerate(missing_originals[:5]):
+                print(f"  - Duplicata: '{dup_path}' -> Original: '{orig_path}'")
+            if len(missing_originals) > 5:
+                print(f"  ... e mais {len(missing_originals) - 5} arquivo(s)")
 
         print(f"[Duplicatas] {created}/{len(duplicates)} arquivos duplicados recriados.")
     else:
@@ -862,36 +1016,93 @@ def main() -> int:
     print(f"{'='*60}\n")
     
     # ------------------------------------------------------------------
-    # RESTORE ACLS (Opcional)
+    # RESTORE METADATA (Embedded or External)
     # ------------------------------------------------------------------
-    if args.acls:
-        print("\n" + "="*60)
-        print("RESTAURAÇÃO DE ACLS/METADATA")
-        print("="*60)
-        
-        # Tentar habilitar privilégios
-        if iotools.enable_se_restore_privilege():
-             print("[System] SeRestorePrivilege habilitado (permite definir Owner/SACL).")
-        if iotools.enable_se_security_privilege():
-             print("[System] SeSecurityPrivilege habilitado (permite manipular SACLs auditoria).")
-        
-        # Localizar arquivo .acls
-        candidates = [
-            parent_dir / f"{prefix}.acls",
-            parent_dir / f"{prefix}.gpu.acls",
-            base_path.with_suffix(".acls")
-        ]
-        
-        acls_found = None
-        for cand in candidates:
-            if cand.exists():
-                acls_found = cand
-                break
+    
+    # 1. Embedded Metadata (GPU_IDX3)
+    # Verificar se o primeiro arquivo tem chaves de metadados
+    has_embedded_meta = False
+    if files and ("sddl" in files[0] or "attrs" in files[0] or "mtime" in files[0]):
+         has_embedded_meta = True
+
+    if has_embedded_meta:
+        if sys.platform == "win32":
+            print("\n" + "="*60)
+            print("RESTAURAÇÃO DE METADADOs (EMBUTIDOS)")
+            print("="*60)
+            
+            # Habilitar privilégios
+            iotools.enable_se_restore_privilege()
+            iotools.enable_se_security_privilege()
+            
+            print(f"[Meta] Aplicando metadados em {len(files)} arquivos...")
+            
+            count = 0
+            import os
+            from acls import set_file_sddl, set_win_attributes
+            
+            for f in files:
+                p = output_dir / f["path_rel"]
+                if not p.exists(): continue
                 
-        if acls_found:
-             acls.restore_acls(acls_found, output_dir)
+                p_str = str(p)
+                
+                # Timestamps
+                at = f.get("atime")
+                mt = f.get("mtime")
+                if at and mt:
+                    try:
+                        os.utime(p_str, (at, mt))
+                    except: pass
+                    
+                # Attributes
+                attrs = f.get("attrs")
+                if attrs:
+                    set_win_attributes(p_str, attrs)
+                    
+                # ACLs (SDDL)
+                sddl = f.get("sddl")
+                if sddl:
+                     set_file_sddl(p_str, sddl)
+                     
+                count += 1
+                if count % 1000 == 0:
+                    print(f"[Meta] {count} processados...", end='\r')
+                    
+            print(f"\n[Meta] Concluído. {count} arquivos atualizados.")
         else:
-             print(f"[ACLS] Aviso: Arquivo .acls não encontrado. (Procurado: {[str(c) for c in candidates]})")
+            print("[Meta] Pular a restauração de metadados em sistema não Windows.")
+
+    # 2. External ACLs (Legacy GPU_IDX1/2) - Only if requested explicitly
+    elif args.acls:
+        if sys.platform == "win32":
+            print("\n" + "="*60)
+            print("RESTAURAÇÃO DE ACLS (ARQUIVO EXTERNO)")
+            print("="*60)
+            
+            if iotools.enable_se_restore_privilege():
+                 print("[System] SeRestorePrivilege habilitado.")
+            if iotools.enable_se_security_privilege():
+                 print("[System] SeSecurityPrivilege habilitado.")
+            
+            candidates = [
+                parent_dir / f"{prefix}.acls",
+                parent_dir / f"{prefix}.gpu.acls",
+                base_path.with_suffix(".acls")
+            ]
+            
+            acls_found = None
+            for cand in candidates:
+                if cand.exists():
+                    acls_found = cand
+                    break
+                    
+            if acls_found:
+                 acls.restore_acls(acls_found, output_dir)
+            else:
+                 print(f"[ACLS] Aviso: Arquivo .acls não encontrado.")
+        else:
+            print("[ACLS] Pular a restauração de ACLs em sistema não Windows.")
 
     return 0
 if __name__ == "__main__":

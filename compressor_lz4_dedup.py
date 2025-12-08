@@ -68,6 +68,7 @@ def compress_directory_lz4(
     index_params: Dict[str, Any],
     total_size_to_compress: int = 0,
     acls_callback = None,
+    collect_metadata: bool = False,
 ) -> List[FrameMeta]:
     """
     Compressor focado em LZ4 GPU e Deduplicação.
@@ -322,7 +323,7 @@ def compress_directory_lz4(
                      "size": len(data),
                      "frame_id": fid,
                      "orig_size": len(data),
-                     "gpu_index": gpu_idx
+                     "gpu_index": -1
                  })
         finally:
             compressor_queue.put(comp)
@@ -541,6 +542,36 @@ def compress_directory_lz4(
     writer.close()
     index_params["frame_modes"] = frame_modes
     
+    # Coletar Metadados (GPU_IDX3) se solicitado
+    if collect_metadata:
+        print("\n[Meta] Coletando metadados (ACLs, Atributos, Timestamps) para o índice interno...")
+        import os
+        count = 0
+        total = len(entries)
+        for i, entry in enumerate(entries):
+            if not entry.path_abs.exists(): continue
+            
+            p_str = str(entry.path_abs)
+            
+            try:
+                # 1. SDDL e Atributos via acls.py
+                entry.sddl = acls.get_file_sddl(p_str)
+                entry.attrs = acls.get_win_attributes(p_str)
+                
+                # 2. Timestamps
+                entry.ctime = os.path.getctime(p_str)
+                entry.mtime = os.path.getmtime(p_str)
+                entry.atime = os.path.getatime(p_str)
+                
+                count += 1
+                if i % 1000 == 0:
+                    print(f"[Meta] Processado {i}/{total}...", end='\r')
+            except Exception as e:
+                # Não falhar compressão por erro de metadados
+                pass
+                
+        print(f"[Meta] Coletado metadados de {count} arquivos.")
+
     # Embed index file
     from iotools import embed_index_file
     last_vol = all_frames[-1].volume_name if all_frames else ""
@@ -551,7 +582,8 @@ def compress_directory_lz4(
         files=list(entries),
         frames=all_frames,
         dictionary=None, # Sem dicionário
-        params=index_params
+        params=index_params,
+        max_volume_size=max_volume_size
     )
     
     return all_frames
@@ -600,25 +632,13 @@ def run_compression_logic(source_dir: Path, output_base: Path, frame_size: int, 
         "compressor": "lz4_cpu" if FORCE_CPU_MODE else "lz4_gpu"
     }
     
-    # Configurar callback de ACLs
-    acls_thread = None
-    acls_callback = None
+    # Configurar coleta de metadados para incluir no índice SQLite
+    # Quando --acls é usado, os metadados são salvos DENTRO do arquivo (GPU_IDX3)
+    # em vez de gerar arquivo .acls externo
+    collect_meta_flag = args.acls if args else False
     
-    if args and args.acls:
-        def trigger_acls():
-            nonlocal acls_thread
-            acls_output = Path(f"{output_base}.acls") # ex: f:/test.acls
-            # Iniciar thread
-            acls_thread = threading.Thread(
-                target=acls.backup_acls,
-                args=(source_dir, acls_output),
-                name="ACLsBackupThread",
-                daemon=True # Daemon=False para garantir que termine
-            )
-            acls_thread.daemon = False 
-            acls_thread.start()
-            
-        acls_callback = trigger_acls
+    if collect_meta_flag:
+        print("[ACLS] Metadados (ACLs, atributos, timestamps) serão incluídos no índice SQLite.")
     
     compress_directory_lz4(
         entries=entries,
@@ -627,14 +647,9 @@ def run_compression_logic(source_dir: Path, output_base: Path, frame_size: int, 
         output_base=output_base,
         index_params=index_params,
         total_size_to_compress=total_size_dedup,
-        acls_callback=acls_callback,
+        acls_callback=None,  # Sem arquivo externo - metadados vão para o SQLite
+        collect_metadata=collect_meta_flag,
     )
-    
-    # Esperar backup de ACLs terminar se ainda estiver rodando
-    if acls_thread:
-        if acls_thread.is_alive():
-             print("[ACLS] Aguardando término da captura de metadados...")
-             acls_thread.join()
 
 def main() -> int:
     global FORCE_CPU_MODE
@@ -646,7 +661,7 @@ def main() -> int:
     parser.add_argument("--volume-size-mb", type=int, default=98, help="Tamanho do volume (MB)")
     parser.add_argument("--cpu", action="store_true", help="Forçar modo CPU (ignorar GPU/OpenCL)")
     parser.add_argument("--vss", action="store_true", help="Usar Volume Shadow Copy (VSS) para ler arquivos em uso (somente Windows, requer Admin)")
-    parser.add_argument("--acls", action="store_true", help="Backup de ACLs/Atributos em arquivo .acls separado")
+    parser.add_argument("--acls", action="store_true", help="Incluir ACLs/Atributos/Timestamps no índice SQLite (GPU_IDX3)")
 
     args = parser.parse_args()
     

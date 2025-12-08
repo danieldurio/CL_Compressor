@@ -101,6 +101,103 @@ def read_footer(archive_path: Path) -> Optional[Dict[str, Any]]:
                     "frames": frames,
                     "params": params
                 }
+
+            elif magic == b'GPU_IDX3':
+                print(f"✓ Footer encontrado (SQLite): Offset={offset}, Size={size} bytes")
+                
+                import gzip
+                import io
+                import shutil
+                import sqlite3
+                import time
+                
+                f.seek(offset)
+                compressed_bytes = f.read(size) # TODO: Chunked copy large index?
+                
+                tmp_dir = Path("tmp").resolve()
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_db_path = tmp_dir / f"treemap_read_{int(time.time())}.db"
+
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(compressed_bytes), mode='rb') as gz:
+                         with open(tmp_db_path, "wb") as db_out:
+                             shutil.copyfileobj(gz, db_out)
+                    
+                    conn = sqlite3.connect(tmp_db_path)
+                    c = conn.cursor()
+                    
+                    # Carregar arquivos com informações extras
+                    print("Carregando lista de arquivos do SQLite...")
+                    c.execute("""
+                        SELECT f.path_rel, f.size, f.is_duplicate, f.original_path,
+                               f.attrs, s.sddl
+                        FROM files f
+                        LEFT JOIN sddls s ON f.sddl_id = s.id
+                    """)
+                    
+                    files = []
+                    for r in c.fetchall():
+                        files.append({
+                            "path_rel": r[0],
+                            "size": r[1] if r[1] is not None else 0,
+                            "is_duplicate": bool(r[2]),
+                            "original_path": r[3],
+                            "attrs": r[4],
+                            "has_acls": r[5] is not None and len(r[5]) > 0 if r[5] else False
+                        })
+                    
+                    # Contar duplicatas por arquivo original
+                    c.execute("""
+                        SELECT original_path, COUNT(*) as dup_count 
+                        FROM files 
+                        WHERE is_duplicate = 1 AND original_path IS NOT NULL
+                        GROUP BY original_path
+                    """)
+                    dup_counts = {r[0]: r[1] for r in c.fetchall()}
+                    
+                    # Adicionar contagem de duplicatas aos arquivos originais
+                    for f in files:
+                        path = f['path_rel']
+                        f['duplicate_count'] = dup_counts.get(path, 0)
+                        f['has_duplicates'] = f['duplicate_count'] > 0
+
+                    # Carregar frames para estatísticas
+                    print("Carregando frames do SQLite...")
+                    c.execute("SELECT id, vol, size, original_size FROM frames")
+                    frames = []
+                    for r in c.fetchall():
+                        frames.append({
+                            "frame_id": r[0],
+                            "volume_name": r[1],
+                            "compressed_size": r[2] if r[2] is not None else 0,
+                            "uncompressed_size": r[3] if r[3] is not None else 0
+                        })
+
+                    # Params?
+                    params = {}
+                    try:
+                        c.execute("SELECT value FROM kv_store WHERE key='params'")
+                        row = c.fetchone()
+                        if row: params = json.loads(row[0])
+                    except: pass
+
+                    conn.close()
+                    
+                    index = {
+                        "files": files,
+                        "frames": frames,
+                        "params": params
+                    }
+                    
+                except Exception as e:
+                    print(f"Erro ao ler SQLite: {e}")
+                    return None
+                    
+                finally:
+                    if tmp_db_path.exists():
+                        try:
+                            tmp_db_path.unlink()
+                        except: pass
             else:
                 print(f"Erro: Assinatura inválida no footer: {magic}")
                 print("Este arquivo pode não ser um arquivo compactado válido.")
@@ -128,9 +225,14 @@ class TreeNode:
         self.total_folders = 0
         self.children: List[TreeNode] = []
         self.is_folder = is_folder
+        # Extras para arquivos
+        self.has_duplicates = False
+        self.duplicate_count = 0
+        self.has_acls = False
     
-    def add_file(self, path_parts: List[str], file_size: int):
+    def add_file(self, path_parts: List[str], file_size: int, file_info: Optional[Dict] = None):
         """Adiciona um arquivo à árvore."""
+        if file_size is None: file_size = 0
         if not path_parts:
             return
         
@@ -139,6 +241,13 @@ class TreeNode:
             file_node = TreeNode(path_parts[0], is_folder=False, size=file_size)
             file_node.total_items = 1
             file_node.total_files = 1
+            
+            # Adicionar informações extras se disponíveis
+            if file_info:
+                file_node.has_duplicates = file_info.get('has_duplicates', False)
+                file_node.duplicate_count = file_info.get('duplicate_count', 0)
+                file_node.has_acls = file_info.get('has_acls', False)
+            
             self.children.append(file_node)
             
             # Acumular no nó pai
@@ -161,9 +270,10 @@ class TreeNode:
                 self.children.append(child)
             
             # Adicionar recursivamente
-            child.add_file(path_parts[1:], file_size)
+            child.add_file(path_parts[1:], file_size, file_info)
             
             # Acumular tamanhos e contagens
+            if file_size is None: file_size = 0
             self.size += file_size
             self.total_items += 1
             self.total_files += 1  # Também incrementar arquivos no nível pai
@@ -185,7 +295,7 @@ class TreeNode:
     
     def to_dict(self) -> Dict[str, Any]:
         """Converte para dicionário para JSON."""
-        return {
+        result = {
             'name': self.name,
             'size': self.size,
             'size_formatted': format_bytes(self.size),
@@ -195,6 +305,14 @@ class TreeNode:
             'is_folder': self.is_folder,
             'children': [c.to_dict() for c in self.children]
         }
+        
+        # Adicionar extras para arquivos
+        if not self.is_folder:
+            result['has_duplicates'] = self.has_duplicates
+            result['duplicate_count'] = self.duplicate_count
+            result['has_acls'] = self.has_acls
+        
+        return result
 
 
 def build_tree(files: List[Dict[str, Any]]) -> TreeNode:
@@ -213,7 +331,7 @@ def build_tree(files: List[Dict[str, Any]]) -> TreeNode:
         path = path.replace('\\', '/')
         parts = [p for p in path.split('/') if p]
         
-        root.add_file(parts, size)
+        root.add_file(parts, size, file_entry)
     
     root.finalize()
     root.sort_children()
@@ -554,6 +672,28 @@ def generate_html(tree_data: Dict[str, Any], stats: Dict[str, Any], output_path:
                 display: none;
             }}
         }}
+
+        .badge {{
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            margin-left: 6px;
+            text-transform: uppercase;
+        }}
+
+        .badge-dup {{
+            background: rgba(255, 193, 7, 0.2);
+            color: #ffc107;
+            border: 1px solid rgba(255, 193, 7, 0.3);
+        }}
+
+        .badge-acls {{
+            background: rgba(13, 202, 240, 0.2);
+            color: #0dcaf0;
+            border: 1px solid rgba(13, 202, 240, 0.3);
+        }}
     </style>
 </head>
 <body>
@@ -706,6 +846,24 @@ def generate_html(tree_data: Dict[str, Any], stats: Dict[str, Any], output_path:
             name.title = node.name;
             headerTop.appendChild(name);
 
+            // Badges para arquivos (não pastas)
+            if (!node.is_folder) {{
+                if (node.has_duplicates) {{
+                    const badge = document.createElement('span');
+                    badge.className = 'badge badge-dup';
+                    badge.textContent = 'DUP:' + node.duplicate_count;
+                    badge.title = 'Este arquivo tem ' + node.duplicate_count + ' cópia(s)';
+                    headerTop.appendChild(badge);
+                }}
+                if (node.has_acls) {{
+                    const badge = document.createElement('span');
+                    badge.className = 'badge badge-acls';
+                    badge.textContent = 'ACLS';
+                    badge.title = 'Arquivo com permissões ACL salvas';
+                    headerTop.appendChild(badge);
+                }}
+            }}
+
             const percent = document.createElement('span');
             percent.className = 'tree-percent';
             percent.textContent = percentage + '%';
@@ -842,8 +1000,30 @@ def main():
     print(f"📂 Lendo arquivo: {archive_path.name}")
     print(f"📄 Saída HTML: {output_path.name}\n")
     
-    # Ler footer e índice
-    index = read_footer(archive_path)
+    # Detectar automaticamente o último volume
+    import re
+    parent_dir = archive_path.parent
+    name_stem = archive_path.name
+    
+    # Resolver prefixo (ex: data.001 -> data ou data.gpu.001 -> data.gpu)
+    match = re.match(r"(.*)\.(\d{3})$", name_stem)
+    if match:
+        prefix = match.group(1)
+    else:
+        prefix = name_stem
+    
+    # Buscar todos os volumes
+    volumes = sorted([v for v in parent_dir.glob(f"{prefix}.*") if re.match(r".*\.\d{3}$", v.name)])
+    
+    if not volumes:
+        print(f"Erro: Nenhum volume encontrado com prefixo '{prefix}' em {parent_dir}")
+        return 1
+    
+    last_vol = volumes[-1]
+    print(f"📁 Volumes encontrados: {len(volumes)}. Último: {last_vol.name}")
+    
+    # Ler footer e índice do ÚLTIMO volume
+    index = read_footer(last_vol)
     if index is None:
         return 1
     
