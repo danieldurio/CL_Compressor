@@ -1,5 +1,15 @@
 # 🚀 CL_Compressor: Motor de Compressão e Deduplicação Acelerado por GPU
 
+### Imagens ilustrativas do CL_Compressor
+
+![Imagem 1 — exemplo de dado / interface ou output](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/1.png)
+
+![Imagem 2 — compressão / deduplicação / desempenho](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/2.png)
+
+![Imagem 3 — estrutura de volumes / index / footer / output final](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/3.png)
+
+
+
 O **CL_Compressor** é uma solução de arquivamento de alto desempenho, projetada para processar grandes volumes de dados com eficiência e velocidade superiores. Ele combina uma arquitetura de pipeline assíncrona, um motor de deduplicação inteligente de múltiplos estágios e um kernel de compressão LZ4 totalmente personalizado e acelerado por GPU (OpenCL).
 
 Desenvolvido para cenários de **backup, ingestão de dados em larga escala e arquivamento versionado**, o CL_Compressor transforma o gargalo de I/O e processamento em um fluxo de trabalho otimizado, aproveitando o poder de processamento paralelo das Unidades de Processamento Gráfico (GPUs).
