@@ -172,6 +172,115 @@ class SQLiteBackend(ArchiveBackend):
         self.volumes = sorted([v for v in parent_dir.glob(f"{prefix}.*") if re.match(r".*\.\d{3}$", v.name)])
         self.parent_dir = parent_dir
         self.prefix = prefix
+        
+        # Detectar colunas opcionais (compatibilidade com archives antigos)
+        self.opt_cols = self._detect_optional_columns()
+        
+        self.file_frame_map = {}
+        if not self.opt_cols['sframe_id']:
+            self._preload_frame_map()
+
+    def _detect_optional_columns(self):
+        """Verifica quais colunas novas existem na tabela files."""
+        c = self.conn.cursor()
+        c.execute("PRAGMA table_info(files)")
+        cols = {row[1] for row in c.fetchall()}
+        
+        return {
+            'attrs': 'attrs' in cols,
+            'ctime': 'ctime' in cols,
+            'mtime': 'mtime' in cols,
+            'atime': 'atime' in cols,
+            'sframe_id': 'sframe_id' in cols
+        }
+
+    def _preload_frame_map(self):
+        """Calcula mapa de frames para arquivos (fallback para archives antigos)."""
+        try:
+            frames = self.get_frames()
+            if not frames: return
+            
+            c = self.conn.cursor()
+            # Iterar todos os arquivos não-duplicados em ordem de criação (ID)
+            c.execute("SELECT path_rel, size, is_duplicate FROM files ORDER BY id")
+            
+            global_offset = 0
+            sorted_frame_ids = sorted(frames.keys())
+            current_frame_idx = 0
+            current_frame_id = sorted_frame_ids[0]
+            current_frame = frames[current_frame_id]
+            frame_end = current_frame['uncompressed_size']
+            frame_start_global = 0 # Frame 0 starts at 0
+
+            # Optimização: Percorrer arquivos e frames linearmente
+            # Mas frames são baseados em global_offset?
+            # get_file_details usa: file_start < fr_end
+            # fr_end é relativo ao frame? Não, get_file_details soma frame_offset + size.
+            # Vamos reconstruir offsets dos frames.
+            
+            # Recalcular offsets globais de inicio de cada frame
+            frame_global_offsets = [] # (start, end, id, vol)
+            acc_frame_offset = 0
+            for fid in sorted_frame_ids:
+                fr = frames[fid]
+                size = fr['uncompressed_size']
+                frame_global_offsets.append((acc_frame_offset, acc_frame_offset + size, fid, fr['volume_name']))
+                acc_frame_offset += size
+                
+            # Agora iterar arquivos
+            current_f_idx = 0
+            max_frames = len(frame_global_offsets)
+            
+            for row in c.fetchall():
+                path = row['path_rel']
+                size = row['size'] if row['size'] else 0
+                is_dup = row['is_duplicate']
+                
+                if is_dup:
+                    continue
+                    
+                file_start = global_offset
+                global_offset += size
+                
+                # Encontrar frame correspondente
+                # O arquivo começa em file_start. 
+                # Se file_start >= current_frame_end, avançar frame
+                while current_f_idx < max_frames:
+                    f_start, f_end, fid, vol = frame_global_offsets[current_f_idx]
+                    if file_start < f_end:
+                         # Arquivo começa neste frame
+                         self.file_frame_map[path] = (fid, vol)
+                         break
+                    current_f_idx += 1
+                    
+        except Exception as e:
+            print(f"Erro ao precalcular frames: {e}")
+
+    def _get_select_fields(self):
+        """Monta a string SELECT e JOIN baseada nas colunas disponíveis."""
+        fields = [
+            "f.path_rel", "f.size", "f.is_duplicate", "f.original_path", 
+            "f.volume_name", "f.offset", "f.compressed_size"
+        ]
+        
+        # Opcionais simples
+        for col in ['attrs', 'ctime', 'mtime', 'atime']:
+            if self.opt_cols.get(col):
+                fields.append(f"f.{col}")
+            else:
+                fields.append(f"NULL as {col}")
+        
+        # Frame ID e Volume Info
+        join = ""
+        if self.opt_cols.get('sframe_id'):
+            fields.append("f.sframe_id")
+            fields.append("fr.vol as frame_vol")
+            join = "LEFT JOIN frames fr ON f.sframe_id = fr.id"
+        else:
+             fields.append("NULL as sframe_id")
+             fields.append("NULL as frame_vol")
+             
+        return ", ".join(fields), join
 
     def list_dir(self, path: str) -> List[Union[FileItem, FolderItem]]:
         # Normalizar path para coincidir com parent_path no DB
@@ -183,19 +292,28 @@ class SQLiteBackend(ArchiveBackend):
         items = []
         c = self.conn.cursor()
         
+        select_fields, join_clause = self._get_select_fields()
+        
         # 1. Buscar Arquivos diretos
-        # SELECT * FROM files WHERE parent_path = ?
-        c.execute("""
-            SELECT path_rel, size, is_duplicate, original_path, volume_name, offset, compressed_size 
-            FROM files 
-            WHERE parent_path = ?
-            ORDER BY path_rel
-        """, (target_parent,))
+        query = f"""
+            SELECT {select_fields}
+            FROM files f
+            {join_clause}
+            WHERE f.parent_path = ?
+            ORDER BY f.path_rel
+        """
+        c.execute(query, (target_parent,))
         
         for row in c.fetchall():
             name = row['path_rel'].rsplit('/', 1)[-1]
             entry = dict(row) # Converter row para dict
-            # Ajustar dict para formato esperado pelo extrator se necessário
+            
+            # Fallback para frames se não tiver coluna
+            if entry.get('sframe_id') is None and row['path_rel'] in self.file_frame_map:
+                fid, vol = self.file_frame_map[row['path_rel']]
+                entry['sframe_id'] = fid
+                entry['frame_vol'] = vol
+                
             items.append(FileItem(name, row['size'], entry))
             
         # 2. Buscar Subpastas
@@ -276,14 +394,18 @@ class SQLiteBackend(ArchiveBackend):
         """
         c = self.conn.cursor()
         
-        # Buscar com LIKE (case-insensitive no SQLite por padrão para ASCII)
-        c.execute("""
-            SELECT path_rel, size, is_duplicate, original_path, volume_name, offset, compressed_size
-            FROM files
-            WHERE path_rel LIKE ?
-            ORDER BY path_rel
+        select_fields, join_clause = self._get_select_fields()
+        
+        # Buscar com LIKE
+        query = f"""
+            SELECT {select_fields}
+            FROM files f
+            {join_clause}
+            WHERE f.path_rel LIKE ?
+            ORDER BY f.path_rel
             LIMIT ?
-        """, (pattern, limit))
+        """
+        c.execute(query, (pattern, limit))
         
         results = []
         for row in c.fetchall():

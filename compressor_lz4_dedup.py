@@ -97,7 +97,7 @@ def compress_directory_lz4(
         USE_CPU_FALLBACK = True
         import multiprocessing
         BATCH_SIZE = multiprocessing.cpu_count() * 2
-        print(f"[Compressor] 🖥️ MODO CPU FORÇADO (--cpu): Batch Size = {BATCH_SIZE} frames ({multiprocessing.cpu_count()} CPUs)")
+        print(f"[Compressor] [CPU] MODO CPU FORCADO (--cpu): Batch Size = {BATCH_SIZE} frames ({multiprocessing.cpu_count()} CPUs)")
     elif not OPENCL_AVAILABLE:
         # Sem OpenCL - usar CPU fallback
         USE_CPU_FALLBACK = True
@@ -713,7 +713,7 @@ def main() -> int:
         run_compression_logic(source_dir_orig, output_base, frame_size, max_volume_size, args)
 
     print("\n" + "="*70)
-    print("✅ Processo Completo Finalizado!")
+    print("[OK] Processo Completo Finalizado!")
     print("="*70)
     return 0
 

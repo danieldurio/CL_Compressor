@@ -39,6 +39,9 @@ class FileEntry:
     mtime: Optional[float] = None
     atime: Optional[float] = None
     original_size: Optional[int] = None # Para duplicatas ou arquivos reprocessados
+    
+    # Rastreamento de Frame
+    start_frame_id: Optional[int] = None # Frame onde o arquivo começa
 
     # Helpers opcionais (caso em algum ponto usem .path ou .rel_path)
     @property
@@ -147,7 +150,7 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
     
     all_entries.sort(key=lambda e: e.path_rel.lower())
     
-    print(f"[SCAN] ✓ {len(all_entries)} arquivos encontrados | {stats['dirs_processed']} dirs | {NUM_SCAN_WORKERS} workers")
+    print(f"[SCAN] [OK] {len(all_entries)} arquivos encontrados | {stats['dirs_processed']} dirs | {NUM_SCAN_WORKERS} workers")
     return all_entries
 
 
@@ -166,10 +169,10 @@ def scan_directory(root: Path, parallel: bool = True) -> List[FileEntry]:
     try:
         all_paths = list(root.rglob("*"))
     except PermissionError as e:
-        print(f"[SCAN] ⚠️ SKIP: Sem permissão para acessar '{root}': {e}")
+        print(f"[SCAN] [WARN] SKIP: Sem permissao para acessar '{root}': {e}")
         return entries
     except OSError as e:
-        print(f"[SCAN] ⚠️ SKIP: Erro ao acessar '{root}': {e}")
+        print(f"[SCAN] [WARN] SKIP: Erro ao acessar '{root}': {e}")
         return entries
 
     for path_abs in all_paths:
@@ -198,7 +201,7 @@ def scan_directory(root: Path, parallel: bool = True) -> List[FileEntry]:
             continue
 
     if skipped_count > 0:
-        print(f"\n[SCAN] 📊 Resumo: {skipped_count} arquivo(s) ignorado(s)")
+        print(f"\n[SCAN] Resumo: {skipped_count} arquivo(s) ignorado(s)")
 
     entries.sort(key=lambda e: e.path_rel.lower())
     return entries
@@ -346,6 +349,7 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
     frame_size = int(frame_size)
     frame_id = 0
     small_files_buffer = bytearray()
+    buffer_entries: List[FileEntry] = []  # Arquivos atualmente no buffer
     
     skipped_files = []
 
@@ -366,6 +370,16 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
                     small_files_buffer.extend(chunk)
                     
                     if len(small_files_buffer) >= frame_size:
+                        # Marcar arquivos do buffer
+                        for e in buffer_entries:
+                            if e.start_frame_id is None:
+                                e.start_frame_id = frame_id
+                        # Se o arquivo atual contribuiu, ele também começa aqui (se ainda não marcado)
+                        if entry.start_frame_id is None:
+                            entry.start_frame_id = frame_id
+                            
+                        buffer_entries = [] # Buffer esvaziado (exceto sobra deste arquivo, handled below)
+                        
                         yield frame_id, bytes(small_files_buffer[:frame_size])
                         del small_files_buffer[:frame_size]
                         frame_id += 1
@@ -385,9 +399,15 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
                     if remaining_file < frame_size:
                         chunk = f.read()
                         small_files_buffer.extend(chunk)
+                        if entry.start_frame_id is None:
+                             entry.start_frame_id = frame_id # Começa no frame atual (que está sendo enchido)
+                        buffer_entries.append(entry)
                         break
                     
                     # Frame inteiro direto
+                    if entry.start_frame_id is None:
+                        entry.start_frame_id = frame_id
+                    
                     chunk = f.read(frame_size)
                     if not chunk: break
                     yield frame_id, chunk
@@ -398,9 +418,13 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
             continue
 
     if skipped_files:
-        print(f"\n[IO] 📊 Resumo: {len(skipped_files)} arquivo(s) pulado(s) durante leitura")
+        print(f"\n[IO] Resumo: {len(skipped_files)} arquivo(s) pulado(s) durante leitura")
         
     if small_files_buffer:
+        # Marcar restantes
+        for e in buffer_entries:
+            if e.start_frame_id is None:
+                e.start_frame_id = frame_id
         yield frame_id, bytes(small_files_buffer)
 
 
@@ -556,7 +580,11 @@ def embed_index_file(
                 attrs INTEGER,
                 ctime REAL,
                 mtime REAL,
-                atime REAL
+                attrs INTEGER,
+                ctime REAL,
+                mtime REAL,
+                atime REAL,
+                sframe_id INTEGER
             )
         """)
         c.execute("CREATE INDEX idx_path ON files(path_rel)")
@@ -606,24 +634,26 @@ def embed_index_file(
             comp_size = get_attr(f, 'compressed_size', 0)
             orig_path = get_attr(f, 'original_path_rel', None)
             
+            sframe_id = get_attr(f, 'start_frame_id', None)
+            
             files_batch.append((
                 path_str, size_val, comp_size, offset_val, vol_val, is_dup, orig_path, parent_str,
-                sddl_id, attrs, ctime, mtime, atime
+                sddl_id, attrs, ctime, mtime, atime, sframe_id
             ))
             
             if len(files_batch) >= BATCH_SIZE:
                 c.executemany("""
                     INSERT INTO files (path_rel, size, compressed_size, offset, volume_name, 
-                                     is_duplicate, original_path, parent_path, sddl_id, attrs, ctime, mtime, atime)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                     is_duplicate, original_path, parent_path, sddl_id, attrs, ctime, mtime, atime, sframe_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, files_batch)
                 files_batch = []
         
         if files_batch:
             c.executemany("""
                     INSERT INTO files (path_rel, size, compressed_size, offset, volume_name, 
-                                     is_duplicate, original_path, parent_path, sddl_id, attrs, ctime, mtime, atime)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                     is_duplicate, original_path, parent_path, sddl_id, attrs, ctime, mtime, atime, sframe_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, files_batch)
         
         if frames:

@@ -412,6 +412,7 @@ def main() -> int:
     parser.add_argument("archive_base", help="Caminho de qualquer volume (ex: F:\\saida_final.001)")
     parser.add_argument("-o", "--output", required=True, help="Pasta de destino")
     parser.add_argument("--acls", action="store_true", help="Restaurar ACLs de arquivo .acls externo (legado GPU_IDX1/2)")
+    parser.add_argument("--files-list", help="Arquivo texto contendo lista de arquivos para extrair (um por linha)")
     
     args = parser.parse_args()
     
@@ -620,6 +621,38 @@ def main() -> int:
     # Mapa de frames por ID
     frames_map = {f["frame_id"]: f for f in frames}
     
+    # Determinar quais arquivos extrair (Seletivo)
+    allowed_paths = None
+    if args.files_list:
+        try:
+            p_list = Path(args.files_list)
+            if p_list.exists():
+                with open(p_list, 'r', encoding='utf-8') as f:
+                     # Normalizar para garantir match: path separators E remover drive/anchor se absoluto
+                     # (pois o carregamento do DB faz isso)
+                     allowed_paths = set()
+                     for line in f:
+                         line = line.strip()
+                         if not line: continue
+                         p = Path(line)
+                         try:
+                             if p.is_absolute():
+                                 p = p.relative_to(p.anchor)
+                         except: pass # Se falhar falhou
+                         allowed_paths.add(str(p))
+                print(f"Modo Seletivo: {len(allowed_paths)} arquivos solicitados.")
+        except Exception as e:
+            print(f"Erro ao ler lista de arquivos: {e}")
+
+    # Marcar arquivos para extração
+    for f in files:
+        if allowed_paths is None:
+             f['should_extract'] = True
+        else:
+             f['should_extract'] = str(Path(f['path_rel'])) in allowed_paths
+
+    # Modos de compressão por frame
+    
     # Modos de compressão por frame
     frame_modes = params.get("frame_modes", {})
     # Converter chaves para int
@@ -657,9 +690,10 @@ def main() -> int:
                 curr_file_entry = files[current_file_idx]
                 
                 if curr_file_entry.get("is_duplicate"):
-                    # Adiar duplicata para o final
-                    duplicates.append(curr_file_entry)
-                        
+                    # Adiar duplicata para o final (apenas se selecionada)
+                    if curr_file_entry.get("should_extract", True):
+                        duplicates.append(curr_file_entry)
+                    
                     current_file_idx += 1
                     current_file_pos = 0
                     continue
@@ -683,44 +717,49 @@ def main() -> int:
             curr_file_entry = files[current_file_idx]
             
             if curr_fp is None:
-                p = output_dir / curr_file_entry["path_rel"]
-                
-                # Verificar se algum componente do caminho existe como arquivo (conflito)
-                try:
-                    parent_path = p.parent
-                    # Verificar todos os ancestrais até o output_dir
-                    for ancestor in list(parent_path.parents) + [parent_path]:
-                        # Parar ao chegar no output_dir
-                        if ancestor == output_dir or ancestor in output_dir.parents:
-                            break
-                        # Verificar se existe como arquivo (conflito)
-                        if ancestor.exists() and ancestor.is_file():
-                            print(f"[ERRO] Conflito de caminho: '{ancestor}' existe como arquivo mas é necessário como diretório")
-                            print(f"       Arquivo destino: {p}")
-                            # Tentar renomear arquivo conflitante
-                            conflicting_file = ancestor
-                            backup_name = conflicting_file.with_suffix(conflicting_file.suffix + ".backup")
-                            print(f"       Renomeando '{conflicting_file}' para '{backup_name}'")
-                            conflicting_file.rename(backup_name)
+                if not curr_file_entry.get("should_extract", True):
+                    curr_fp = None
+                else:
+                    p = output_dir / curr_file_entry["path_rel"]
                     
-                    parent_path.mkdir(parents=True, exist_ok=True)
-                except FileExistsError as e:
-                    print(f"[ERRO] Não foi possível criar diretório '{parent_path}': {e}")
-                    print(f"       Arquivo destino: {p}")
-                    raise
-                
-                curr_fp = open(p, "wb")
+                    # Verificar se algum componente do caminho existe como arquivo (conflito)
+                    try:
+                        parent_path = p.parent
+                        # Verificar todos os ancestrais até o output_dir
+                        for ancestor in list(parent_path.parents) + [parent_path]:
+                            # Parar ao chegar no output_dir
+                            if ancestor == output_dir or ancestor in output_dir.parents:
+                                break
+                            # Verificar se existe como arquivo (conflito)
+                            if ancestor.exists() and ancestor.is_file():
+                                print(f"[ERRO] Conflito de caminho: '{ancestor}' existe como arquivo mas é necessário como diretório")
+                                print(f"       Arquivo destino: {p}")
+                                # Tentar renomear arquivo conflitante
+                                conflicting_file = ancestor
+                                backup_name = conflicting_file.with_suffix(conflicting_file.suffix + ".backup")
+                                print(f"       Renomeando '{conflicting_file}' para '{backup_name}'")
+                                conflicting_file.rename(backup_name)
+                        
+                        parent_path.mkdir(parents=True, exist_ok=True)
+                    except FileExistsError as e:
+                        print(f"[ERRO] Não foi possível criar diretório '{parent_path}': {e}")
+                        print(f"       Arquivo destino: {p}")
+                        raise
+                    
+                    curr_fp = open(p, "wb")
             
             remaining = (curr_file_entry.get("size") or 0) - current_file_pos
             chunk_size = min(data_len - data_pos, remaining)
             
-            curr_fp.write(data[data_pos : data_pos + chunk_size])
+            if curr_fp:
+                curr_fp.write(data[data_pos : data_pos + chunk_size])
             
             current_file_pos += chunk_size
             data_pos += chunk_size
             
             if current_file_pos >= (curr_file_entry.get("size") or 0):
-                curr_fp.close()
+                if curr_fp:
+                    curr_fp.close()
                 curr_fp = None
                 current_file_idx += 1
                 current_file_pos = 0
