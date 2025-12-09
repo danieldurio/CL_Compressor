@@ -289,6 +289,123 @@ class GPUFileDeduplicator:
         # Retorna int para compatibilidade com o código existente
         return int(hashlib.md5(data).hexdigest(), 16)
 
+    def compute_batch_hash(self, entries_data: list) -> list:
+        """
+        Calcula hash de múltiplos arquivos em batch na GPU.
+        
+        Args:
+            entries_data: Lista de (entry, data_bytes) tuplas
+            
+        Returns:
+            Lista de (entry, hash_value) tuplas
+        """
+        if not self.enabled or not entries_data:
+            # Fallback CPU
+            return [(e, self._hash_bytes(d)) for e, d in entries_data]
+        
+        BLOCK_SIZE = 256 * 1024  # 256KB por bloco
+        
+        # Selecionar GPU (Round-Robin thread-safe)
+        import threading
+        if not hasattr(self, '_gpu_lock'):
+            self._gpu_lock = threading.Lock()
+        
+        with self._gpu_lock:
+            gpu_res = self._contexts[self._current_device_idx]
+            self._current_device_idx = (self._current_device_idx + 1) % self._num_devices
+        
+        ctx = gpu_res["ctx"]
+        queue = gpu_res["queue"]
+        program = gpu_res["program"]
+        
+        results = []
+        
+        try:
+            # Processar arquivos que cabem na GPU (< 50MB cada)
+            gpu_batch = []
+            cpu_fallback = []
+            
+            for entry, data in entries_data:
+                if data is None or len(data) == 0:
+                    # Hash placeholder para dados inválidos
+                    cpu_fallback.append((entry, hash(str(entry.path_abs))))
+                elif len(data) > 50 * 1024 * 1024:
+                    # Arquivo muito grande - CPU fallback
+                    cpu_fallback.append((entry, self._hash_bytes(data)))
+                else:
+                    gpu_batch.append((entry, data))
+            
+            if not gpu_batch:
+                return cpu_fallback
+            
+            # Preparar dados para GPU - concatenar todos em buffer único
+            # Cada arquivo precisa estar alinhado para BLOCK_SIZE
+            padded_datas = []
+            file_offsets = []  # (start_block, num_blocks) por arquivo
+            current_block = 0
+            
+            for entry, data in gpu_batch:
+                n = len(data)
+                num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+                padded_len = num_blocks * BLOCK_SIZE
+                
+                if n < padded_len:
+                    padded_data = data + b'\0' * (padded_len - n)
+                else:
+                    padded_data = data
+                
+                padded_datas.append(padded_data)
+                file_offsets.append((current_block, num_blocks))
+                current_block += num_blocks
+            
+            # Concatenar tudo em um único buffer
+            total_blocks = current_block
+            combined_data = b''.join(padded_datas)
+            
+            arr_in = np.frombuffer(combined_data, dtype=np.uint8)
+            
+            mf = self._cl.mem_flags
+            buf_in = self._cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=arr_in)
+            
+            hashes = np.zeros(total_blocks, dtype=np.uint64)
+            buf_hashes = self._cl.Buffer(ctx, mf.WRITE_ONLY, hashes.nbytes)
+            
+            kernel = self._cl.Kernel(program, "block_fnv1a")
+            kernel.set_args(buf_in, np.uint32(BLOCK_SIZE), np.uint32(total_blocks), buf_hashes)
+            
+            # Executar todos os blocos de uma vez!
+            self._cl.enqueue_nd_range_kernel(queue, kernel, (total_blocks,), None)
+            queue.finish()
+            
+            self._cl.enqueue_copy(queue, hashes, buf_hashes).wait()
+            
+            # Combinar hashes por arquivo na CPU
+            prime = 0x100000001b3
+            
+            for i, (entry, data) in enumerate(gpu_batch):
+                start_block, num_blocks = file_offsets[i]
+                file_hashes = hashes[start_block:start_block + num_blocks]
+                
+                final_hash = 0xcbf29ce484222325
+                for h in file_hashes:
+                    final_hash ^= int(h)
+                    final_hash *= prime
+                    final_hash &= 0xFFFFFFFFFFFFFFFF
+                
+                results.append((entry, final_hash))
+            
+            # Adicionar fallbacks
+            results.extend(cpu_fallback)
+            
+            return results
+            
+        except Exception as e:
+            # Fallback CPU completo em caso de erro
+            import traceback
+            traceback.print_exc()
+            print(f"[Deduplicator] Erro batch GPU: {e}. Fallback CPU.")
+            return [(e, self._hash_bytes(d) if d else hash(str(e.path_abs))) for e, d in entries_data]
+
 
     def find_duplicates(self, entries: List[FileEntry]) -> List[FileEntry]:
         """
@@ -533,75 +650,168 @@ class GPUFileDeduplicator:
                 for entry in group:
                     entry_to_group[entry.path_abs] = gid
             
-            # Contador de erros para evitar spam de logs
-            error_count = 0
-            MAX_ERRORS_LOG = 10
+            # ===================================================================
+            # GPU BATCH PROCESSING: Múltiplos workers processando batches
+            # ===================================================================
+            HASH_BATCH_SIZE = config_loader.get_hash_batch_size()
+            DEDUP_GPU_WORKERS = config_loader.get_dedup_gpu_workers()
             
-            # Processar com GPU (Consumer) - loop otimizado com error handling
-            try:
+            print(f"[Dedup Stage 5] GPU Batch Mode: {HASH_BATCH_SIZE} files/batch | {DEDUP_GPU_WORKERS} GPU workers")
+            
+            # Fila de resultados processados (thread-safe)
+            results_queue = queue.Queue()
+            batch_queue = queue.Queue(maxsize=DEDUP_GPU_WORKERS * 2)  # Limitar batches pendentes
+            
+            # Contadores thread-safe
+            stats_lock = threading.Lock()
+            stats = {'processed': 0, 'small_removed': 0, 'small_remaining': 0, 'errors': 0}
+            
+            # Worker que processa batches na GPU
+            def gpu_batch_worker(worker_id: int):
+                """Thread que processa batches de hash na GPU."""
+                local_results = []
+                while True:
+                    try:
+                        batch = batch_queue.get(timeout=0.5)
+                        if batch is None:  # Sentinel para encerrar
+                            break
+                        
+                        # batch = lista de (entry, size, file_data)
+                        entries_data = [(e, d) for e, s, d in batch]
+                        
+                        # Processar batch inteiro na GPU
+                        hash_results = self.compute_batch_hash(entries_data)
+                        
+                        # Colocar resultados na fila
+                        for (entry, hash_val), (_, size, _) in zip(hash_results, batch):
+                            results_queue.put((entry, size, hash_val))
+                            
+                    except queue.Empty:
+                        # Verificar se readers terminaram e filas vazias
+                        if readers_done.is_set() and batch_queue.empty():
+                            break
+                    except Exception as e:
+                        with stats_lock:
+                            stats['errors'] += 1
+                        if stats['errors'] <= 10:
+                            print(f"[Dedup Stage 5] GPU Worker {worker_id} erro: {e}")
+            
+            # Iniciar GPU workers
+            gpu_workers = []
+            for i in range(DEDUP_GPU_WORKERS):
+                t = threading.Thread(
+                    target=gpu_batch_worker,
+                    args=(i,),
+                    name=f"GPUWorker-{i}",
+                    daemon=True
+                )
+                t.start()
+                gpu_workers.append(t)
+            
+            # Thread que acumula arquivos em batches
+            def batch_accumulator():
+                """Thread que acumula arquivos da fila de leitura em batches."""
+                current_batch = []
                 while True:
                     try:
                         item = data_queue.get(timeout=0.1)
-                        entry, size, file_data = item
+                        current_batch.append(item)
                         
-                        processed_count += 1
+                        # Enviar batch quando cheio
+                        if len(current_batch) >= HASH_BATCH_SIZE:
+                            batch_queue.put(current_batch)
+                            current_batch = []
+                            
+                    except queue.Empty:
+                        if readers_done.is_set() and data_queue.empty():
+                            # Enviar último batch parcial
+                            if current_batch:
+                                batch_queue.put(current_batch)
+                            break
+                
+                # Enviar sentinels para encerrar workers
+                for _ in range(DEDUP_GPU_WORKERS):
+                    batch_queue.put(None)
+            
+            # Iniciar thread acumuladora
+            accumulator_thread = threading.Thread(
+                target=batch_accumulator,
+                name="BatchAccumulator",
+                daemon=True
+            )
+            accumulator_thread.start()
+            
+            # Consumidor principal: processa resultados e detecta duplicatas
+            MAX_ERRORS_LOG = 10
+            
+            try:
+                while True:
+                    try:
+                        entry, size, hash_val = results_queue.get(timeout=0.1)
+                        
+                        with stats_lock:
+                            stats['processed'] += 1
+                            processed_count = stats['processed']
                         
                         # Feedback a cada 1000 arquivos
                         if processed_count % 1000 == 0:
                             pct = (processed_count / small_count) * 100
-                            qsize = data_queue.qsize()
-                            print(f"[Dedup Stage 5] Progresso: {processed_count}/{small_count} ({pct:.1f}%) - Duplicatas: {small_removed} | Buffer: {qsize}")
+                            qsize = results_queue.qsize()
+                            bqsize = batch_queue.qsize()
+                            with stats_lock:
+                                current_removed = stats['small_removed']
+                            print(f"[Dedup Stage 5] Progresso: {processed_count}/{small_count} ({pct:.1f}%) - Duplicatas: {current_removed} | Batch Q: {bqsize} | Result Q: {qsize}")
                         
-                        # Verificar se entry está no mapa (safety check)
+                        # Verificar se entry está no mapa
                         if entry.path_abs not in entry_to_group:
-                            small_remaining += 1
+                            with stats_lock:
+                                stats['small_remaining'] += 1
                             continue
                         
                         gid = entry_to_group[entry.path_abs]
                         hashes = group_hashes[gid]
                         
-                        if file_data is None:
-                            hashes[hash(entry.path_abs)] = entry
-                            small_remaining += 1
+                        if hash_val in hashes:
+                            original = hashes[hash_val]
+                            entry.is_duplicate = True
+                            entry.original_path_rel = original.path_rel
+                            dupes_count += 1
+                            bytes_saved += size
+                            with stats_lock:
+                                stats['small_removed'] += 1
                         else:
-                            try:
-                                h = self.compute_data_hash(file_data)
-                            except Exception as hash_err:
-                                error_count += 1
-                                if error_count <= MAX_ERRORS_LOG:
-                                    print(f"[Dedup Stage 5] Erro hash: {hash_err}")
-                                # Fallback: usar hash Python nativo
-                                h = hash(file_data[:1024]) if len(file_data) > 0 else hash(entry.path_abs)
-                            
-                            if h in hashes:
-                                original = hashes[h]
-                                entry.is_duplicate = True
-                                entry.original_path_rel = original.path_rel
-                                dupes_count += 1
-                                bytes_saved += size
-                                small_removed += 1
-                            else:
-                                hashes[h] = entry
-                                small_remaining += 1
+                            hashes[hash_val] = entry
+                            with stats_lock:
+                                stats['small_remaining'] += 1
                         
                     except queue.Empty:
-                        if readers_done.is_set() and data_queue.empty():
+                        # Verificar se todos os workers terminaram
+                        all_done = all(not w.is_alive() for w in gpu_workers)
+                        if all_done and results_queue.empty():
                             break
                     except Exception as item_err:
-                        error_count += 1
-                        if error_count <= MAX_ERRORS_LOG:
-                            print(f"[Dedup Stage 5] Erro processando item: {item_err}")
-                        # Continuar processando outros itens
-                        continue
+                        with stats_lock:
+                            stats['errors'] += 1
+                            if stats['errors'] <= MAX_ERRORS_LOG:
+                                print(f"[Dedup Stage 5] Erro processando resultado: {item_err}")
                         
             except Exception as loop_err:
                 import traceback
                 print(f"[Dedup Stage 5] ERRO CRÍTICO no loop: {loop_err}")
                 traceback.print_exc()
             
-            # Aguardar todos os readers terminarem
+            # Aguardar todos os workers terminarem
+            accumulator_thread.join(timeout=5)
+            for t in gpu_workers:
+                t.join(timeout=2)
             for t in readers:
                 t.join(timeout=2)
+            
+            # Atualizar contadores finais
+            with stats_lock:
+                small_removed = stats['small_removed']
+                small_remaining = stats['small_remaining']
+                error_count = stats['errors']
             
             if error_count > 0:
                 print(f"[Dedup Stage 5] Total de erros durante processamento: {error_count}")

@@ -125,6 +125,8 @@ def _get_defaults() -> Dict[str, Any]:
         'NUM_IO_WORKERS': 4,
         'NUM_READERS': 4,
         'BUFFER_SIZE': 256,
+        'HASH_BATCH_SIZE': 128,     # Arquivos por batch de hash GPU (Stage 5)
+        'DEDUP_GPU_WORKERS': 8,     # Workers paralelos consumindo GPU
         
         # GPU Kernel
         'HASH_LOG': 20,
@@ -202,3 +204,11 @@ def get_hash_candidates() -> int:
 def get_good_enough_match() -> int:
     """Retorna GOOD_ENOUGH_MATCH."""
     return int(get('GOOD_ENOUGH_MATCH', 128))
+
+def get_hash_batch_size() -> int:
+    """Retorna HASH_BATCH_SIZE - arquivos por batch de hash GPU."""
+    return int(get('HASH_BATCH_SIZE', 128))
+
+def get_dedup_gpu_workers() -> int:
+    """Retorna DEDUP_GPU_WORKERS - workers paralelos de hash GPU."""
+    return int(get('DEDUP_GPU_WORKERS', 2))
