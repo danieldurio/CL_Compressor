@@ -14,7 +14,7 @@
 
 ![Imagem 6 Explorer CLI](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/6.jpg)
 
-
+![Imagem 7 Dual GPU Test](https://raw.githubusercontent.com/danieldurio/CL_Compressor/main/test/7.png)
 
 O **CL_Compressor** é uma solução de arquivamento de alto desempenho, projetada para processar grandes volumes de dados com eficiência e velocidade superiores. Ele combina uma arquitetura de pipeline assíncrona, um motor de deduplicação inteligente de múltiplos estágios e um kernel de compressão LZ4 totalmente personalizado e acelerado por GPU (OpenCL).
 
