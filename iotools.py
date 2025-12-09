@@ -580,9 +580,6 @@ def embed_index_file(
                 attrs INTEGER,
                 ctime REAL,
                 mtime REAL,
-                attrs INTEGER,
-                ctime REAL,
-                mtime REAL,
                 atime REAL,
                 sframe_id INTEGER
             )
