@@ -290,25 +290,30 @@ def compress_directory_lz4(
                 if batch_id is not None and progress_pct in [20, 40, 60, 80] and (i + 1) == int(batch_size * progress_pct / 100):
                     print(f"[Batch {batch_id}] {progress_pct}% processado ({i + 1}/{batch_size} frames)")
                 
-                res = {
-                    "mode": "raw",
-                    "bytes": orig_data,
-                    "size": orig_size,
-                    "frame_id": fid,
-                    "orig_size": orig_size,
-                    "gpu_index": gpu_idx
-                }
-                
+                # Otimização de RAM: construir resultado apenas com dados necessários
                 if res_size < orig_size and res_size > 0:
-                    res["mode"] = "lz_ext3_gpu"
-                    res["bytes"] = res_bytes
-                    res["size"] = res_size
-                    
+                    res = {
+                        "mode": "lz_ext3_gpu",
+                        "bytes": res_bytes,  # Apenas bytes comprimidos
+                        "size": res_size,
+                        "frame_id": fid,
+                        "orig_size": orig_size,
+                        "gpu_index": gpu_idx
+                    }
                     # Log periódico
                     if fid % 100 == 0:
                         ratio = (res_size / orig_size) * 100
                         saved = orig_size - res_size
                         print(f"[LZ4] Frame {fid} GPU{gpu_idx+1}: {orig_size} -> {res_size} ({ratio:.1f}%) | Economia: {saved}")
+                else:
+                    res = {
+                        "mode": "raw",
+                        "bytes": orig_data,  # Mantém originais apenas para RAW
+                        "size": orig_size,
+                        "frame_id": fid,
+                        "orig_size": orig_size,
+                        "gpu_index": gpu_idx
+                    }
                 
                 results.append(res)
                 
@@ -487,7 +492,7 @@ def compress_directory_lz4(
                 f = executor.submit(compress_batch_task, list(current_batch), batch_counter)
                 futures[batch_counter] = f
                 batch_counter += 1
-                current_batch = []
+                current_batch.clear()  # Otimização RAM: liberar referências imediatamente
                 
                 # Backpressure: limitar batches em voo
                 max_pending_batches = num_workers * 2
