@@ -215,4 +215,5 @@ A arquitetura é extensível, robusta e adequada a ambientes corporativos e pess
 
 
 ---
-
+Para Gerar o seu EXE standalone:
+pyinstaller --name "LZ4 GPU Explorer CLI" --onefile explorer.py --add-data "config.txt;."
