@@ -67,19 +67,18 @@ except ImportError:
 
 def scan_directory_parallel(root: Path) -> List[FileEntry]:
     """
-    Scanner paralelo otimizado com Arquitetura Producer-Consumer (3-Stage).
+    Scanner paralelo otimizado com Arquitetura Producer-Consumer Auto-Alimentada (Self-Feeding).
     
-    Stages:
-    1. Discovery Thread (Producer): Varre estrutura de diretórios e popula 'pending_dirs'.
-    2. Distributor Thread: Monitora workers e distribui lotes da 'pending_dirs' para 'worker_queues'.
-    3. Worker Threads (Consumers): Processam suas filas locais de forma atômica e isolada.
+    1. Seed Inicial: Raiz vai para a fila.
+    2. Distributor: Move tarefas da fila global para filas locais de workers ociosos.
+    3. Workers: Processam arquivos E descobrem novos subdiretórios, enviando de volta para a fila global.
     """
     root = root.resolve()
     
     # --- Estruturas de Dados ---
     
     # Fila de diretórios descobertos aguardando distribuição
-    # Discovery -> Distributor
+    # Workers -> Distributor
     pending_dirs_queue: Queue[Path] = Queue()
     
     # Filas individuais por worker
@@ -97,155 +96,110 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
     
     # Global Stats
     global_stats = {
-        "discovery_count": 0,  # Total de dirs encontrados pelo Discovery
-        "distributed_count": 0, # Total de dirs entregues aos workers
+        "pending_count": 0,     # Itens na fila global (estimativa)
         "processed_dirs": 0,    # Total processado efetivamente
         "processed_files": 0
     }
     
     # Eventos de Controle
-    discovery_done = threading.Event()
-    distributor_done = threading.Event()
+    all_done_event = threading.Event() # Setado pelo Distributor quando ACABAR tudo
     
     # Batch Size para distribuição
     TASK_BATCH_SIZE = 1000
     
+    # Inicializar com a raiz
+    pending_dirs_queue.put(root)
+    
     # -----------------------------------------------------------------------
-    # 1. Discovery Thread (Producer)
-    # -----------------------------------------------------------------------
-    def discovery_task():
-        try:
-            count = 0
-            # Usar os.walk é eficiente o suficiente para listar diretórios?
-            # Ou BFS manual? O usuário pediu "avanca de subdir".
-            # os.walk é DFS bottom-up ou top-down. Top-down é melhor para stream.
-            # Vamos usar os.walk(topdown=True) e apenas coletar os nomes de diretórios para scan.
-            
-            # Nota: Scan paralelo pressupõe que workers vão ler arquivos.
-            # Se discovery entregar a pasta, o worker faz scandir nela.
-            
-            # Otimização: Discovery apenas navega na estrutura. Worker lista arquivos.
-            
-            # Adicionar ROOT inicial
-            pending_dirs_queue.put(root)
-            count += 1
-            
-            # BFS Manual ou Walk? 
-            # Se usarmos os.walk, ele já faz o scandir. Se o worker fizer scandir de novo, é trabalho duplicado?
-            # Sim. Mas os.walk retorna (root, dirs, files).
-            # Podemos enviar (root, files) para o worker? Sim, mas serialized é ruim.
-            # Melhor: Discovery faz apenas a navegação estrutural rápida (os.scandir recursivo ou stack).
-            
-            # Vamos usar uma stack manual para controle total e evitar lock de GIL longo do os.walk
-            stack = [root]
-            while stack:
-                current_dir = stack.pop()
-                
-                # Scan para achar subdirs
-                try:
-                    subdirs = []
-                    # Worker vai precisar processar este diretório também para pegar arquivos?
-                    # Sim. Então cada diretório visitado é uma tarefa para workers e fonte de novos dirs.
-                    
-                    # Vamos otimizar: Discovery faz scandir, separa subdirs para stack e
-                    # manda o prorprio current_dir para processamento de arquivos.
-                    # Mas se Discovery faz scandir, ele já viu os arquivos.
-                    # Se não aproveitarmos isso, o worker vai fazer scandir de novo -> I/O duplicado.
-                    
-                    # Solução Híbrida Performance:
-                    # Discovery navega. Mas para evitar duplicar I/O, Discovery poderia listar tudo.
-                    # MAS, o gargalo é "stat" em milhões de arquivos.
-                    # os.scandir é rápido (só nomes). stat é lento.
-                    # Então: Discovery faz os.scandir APENAS para achar DIRs (skip files stat).
-                    # Worker faz os.scandir NO MESMO dir para pegar FILEs e fazer stat.
-                    # O "custo" de abrir a pasta 2x é menor que serializar milhões de file entries entre threads.
-                    # O cache do SO (MFT) ajuda na segunda leitura.
-                    
-                    # Implementação: Stack DFS
-                    with os.scandir(current_dir) as it:
-                        for entry in it:
-                            if entry.is_dir(follow_symlinks=False):
-                                path_obj = Path(entry.path)
-                                subdirs.append(path_obj)
-                                # Adiciona à fila de trabalho (pending)
-                                pending_dirs_queue.put(path_obj)
-                                count += 1
-                                
-                                # Flush periódico no count
-                                if count % 100 == 0:
-                                    with stats_lock:
-                                        global_stats["discovery_count"] = count
-                    
-                    # Adicionar subdirs à stack para continuar descoberta
-                    # Reverse para DFS ou normal? Tanto faz.
-                    stack.extend(subdirs)
-                    
-                except OSError:
-                    pass
-        finally:
-            with stats_lock:
-                global_stats["discovery_count"] = count
-            discovery_done.set()
-            # print("[Discovery] Finalizado.")
-
-    # -----------------------------------------------------------------------
-    # 2. Distributor Thread
+    # 1. Distributor Thread (The Gateway)
     # -----------------------------------------------------------------------
     def distributor_task():
-        while not discovery_done.is_set() or not pending_dirs_queue.empty():
-            # Estratégia:
-            # 1. Verificar workers ociosos (queue vazia ou baixa)
-            # 2. Se tiver pending, puxar batch e entregar
-            
-            try:
-                # Sleep curto para não busy-wait se não tiver trabalho
-                if pending_dirs_queue.empty():
-                    import time
-                    time.sleep(0.05)
-                    continue
-                
-                # Check workers que precisam de trabalho
-                target_workers = []
-                for i in range(NUM_SCAN_WORKERS):
-                    # Critério: Fila vazia ou quase vazia?
-                    # Se tiver menos que um batch, manda mais.
-                    if worker_queues[i].qsize() < 2: 
-                        target_workers.append(i)
-                
-                if not target_workers:
-                    # Todos ocupados, aguarda um pouco
-                    import time
-                    time.sleep(0.1)
-                    continue
-                
-                # Temos workers famintos e trabalho pendente.
-                # Distribui Round-Robin para os famintos
-                for worker_id in target_workers:
-                    if pending_dirs_queue.empty():
-                        break
-                        
-                    # Montar Batch
-                    batch = []
-                    try:
-                        while len(batch) < TASK_BATCH_SIZE:
-                            item = pending_dirs_queue.get_nowait()
-                            batch.append(item)
-                    except Empty:
-                        pass
-                    
-                    if batch:
-                        worker_queues[worker_id].put(batch)
-                        with stats_lock:
-                            global_stats["distributed_count"] += len(batch)
-                            
-            except Exception as e:
-                print(f"[Distributor] Error: {e}")
+        # Loop principal
+        import time
         
-        distributor_done.set()
-        # print("[Distributor] Finalizado.")
+        while True:
+            # Condição de Saída (Termination Detection):
+            # 1. Fila pendente vazia
+            # 2. TODAS as filas de workers vazias
+            # 3. TODOS os workers inativos (Idle/Wait)
+            
+            is_pending_empty = pending_dirs_queue.empty()
+            
+            if is_pending_empty:
+                # Verificar se o sistema inteiro parou
+                all_idle = True
+                any_queue_has_items = False
+                
+                # Check status (sem lock para velocidade, ou com lock se precisar precisão absoluta)
+                # A precisão absoluta é necessaria para não sair prematuramente.
+                
+                # Vamos checar filas primeiro (mais rápido)
+                for q in worker_queues:
+                    if not q.empty():
+                        any_queue_has_items = True
+                        break
+                
+                if not any_queue_has_items:
+                    # Checar se threads estão ativas
+                    with stats_lock:
+                         for ws in worker_stats:
+                             if ws["active"]:
+                                 all_idle = False
+                                 break
+                    
+                    if all_idle:
+                        # Double check após um pequeno sleep para garantir que não é um gap temporário
+                        time.sleep(0.1)
+                        if pending_dirs_queue.empty(): # Confirma fila global ainda vazia
+                             # (Poderíamos re-checar workers, mas vamos assumir estabilidade)
+                             break
+            
+            # --- Distribuição ---
+            
+            if is_pending_empty:
+                time.sleep(0.01) # Low latency sleep
+                continue
+                
+            # Temos trabalho global. Quem precisa?
+            # Estratégia: Encher qqr um que tenha pouco (< 2 batches)
+            # Priorizar quem está vazio.
+            
+            target_workers = []
+            for i in range(NUM_SCAN_WORKERS):
+                if worker_queues[i].qsize() < 2:
+                    target_workers.append(i)
+            
+            if not target_workers:
+                time.sleep(0.05)
+                continue
+                
+            # Sort targets? Não precisa. Round robin implícito.
+            for worker_id in target_workers:
+                if pending_dirs_queue.empty():
+                    break
+                
+                # Montar Batch
+                batch = []
+                try:
+                    # Tentar pegar até TASK_BATCH_SIZE
+                    # Otimização: Se tem MUITA coisa, pega logo o max
+                    # Se tem pouco, pega o que tem.
+                    
+                    # Loop rápido de get
+                    for _ in range(TASK_BATCH_SIZE):
+                        item = pending_dirs_queue.get_nowait()
+                        batch.append(item)
+                except Empty:
+                    pass
+                
+                if batch:
+                    worker_queues[worker_id].put(batch)
+        
+        all_done_event.set()
+        # print("[Distributor] All Done.")
 
     # -----------------------------------------------------------------------
-    # 3. Worker Threads (Consumers)
+    # 2. Worker Threads (Self-Feeding Consumers)
     # -----------------------------------------------------------------------
     def worker_task(worker_id):
         my_queue = worker_queues[worker_id]
@@ -255,66 +209,80 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
         w_files = 0
         
         while True:
-            # Check de terminação
+            # --- Fetch Work ---
             if my_queue.empty():
-                if distributor_done.is_set():
-                    # Se distributor acabou e minha fila ta vazia, acabou.
+                if all_done_event.is_set():
                     break
-                else:
-                    # Espera trabalho chegar
-                    with stats_lock:
-                       worker_stats[worker_id]["status"] = "Wait"
-                       worker_stats[worker_id]["active"] = False
-                    
-                    try:
-                        # Blocking get com timeout para checar flag de saida
-                        batch = my_queue.get(timeout=0.5)
-                    except Empty:
-                        continue
+                
+                # Wait state
+                with stats_lock:
+                   worker_stats[worker_id]["status"] = "Wait"
+                   worker_stats[worker_id]["active"] = False
+                
+                try:
+                    batch = my_queue.get(timeout=0.1)
+                except Empty:
+                    continue
             else:
-                # Tem trabalho, pega non-blocking (já sabemos que tem)
                 try:
                     batch = my_queue.get_nowait()
                 except Empty:
-                    continue
+                     # Race rara
+                     continue
             
-            # Processar Batch
+            # --- Process Work ---
             with stats_lock:
                 worker_stats[worker_id]["status"] = "Work"
                 worker_stats[worker_id]["active"] = True
             
+            local_new_dirs = []
+            
             for dir_path in batch:
                 w_dirs += 1
                 try:
-                    # Scan apenas de ARQUIVOS neste diretório (não recursivo)
+                    # Único SCANDIR. Coleta arquivos E pastas.
                     with os.scandir(dir_path) as it:
                         for entry in it:
-                            if entry.is_file(follow_symlinks=False):
+                            if entry.is_dir(follow_symlinks=False):
+                                # Descoberta: Enviar para fila global!
+                                # Otimização: Acumular locais e enviar em batch
+                                local_new_dirs.append(Path(entry.path))
+                                
+                            elif entry.is_file(follow_symlinks=False):
                                 try:
                                     path_obj = Path(entry.path)
-                                    # size = entry.stat().st_size
                                     stat_res = entry.stat()
                                     size = stat_res.st_size
                                     
                                     path_rel = str(path_obj.relative_to(root)).replace("\\", "/")
                                     local_entries.append(FileEntry(path_abs=path_obj, path_rel=path_rel, size=size))
                                     w_files += 1
-                                except OSError:
-                                    pass
+                                except OSError: pass
                 except OSError:
                     pass
                 
-                # Flush periódico
+                # Se acumulou muitos subdirs, descarregar para liberar memória e alimentar distributor
+                if len(local_new_dirs) > 500:
+                    for d in local_new_dirs:
+                        pending_dirs_queue.put(d)
+                    local_new_dirs = []
+                
+                # Flush stats periódico
                 if w_dirs >= 50:
                     with stats_lock:
                          worker_stats[worker_id]["dirs"] += w_dirs
                          worker_stats[worker_id]["files"] += w_files
-                         global_stats["processed_dirs"] += w_dirs # Global aggregate
+                         global_stats["processed_dirs"] += w_dirs
                          global_stats["processed_files"] += w_files
                     w_dirs = 0
                     w_files = 0
             
-            # Flush fim do Batch
+            # Descarregar sobras de subdirs
+            if local_new_dirs:
+                for d in local_new_dirs:
+                    pending_dirs_queue.put(d)
+            
+            # Flush stats final do batch
             if w_dirs > 0 or w_files > 0:
                 with stats_lock:
                      worker_stats[worker_id]["dirs"] += w_dirs
@@ -326,7 +294,7 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
             
             my_queue.task_done()
         
-        # Persistir resultados finais
+        # Cleanup
         with stats_lock:
              worker_stats[worker_id]["status"] = "Done"
              worker_stats[worker_id]["active"] = False
@@ -336,16 +304,16 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
                 results.extend(local_entries)
 
     # -----------------------------------------------------------------------
-    # 4. Monitor Thread
+    # 3. Monitor Thread
     # -----------------------------------------------------------------------
     def monitor_task():
         import time
-        while not distributor_done.is_set(): # Monitora até distributor acabar (workers acabam logo depois)
+        while not all_done_event.is_set():
              time.sleep(SCAN_STATUS_INTERVAL)
-             # Se distributor acabou, sai do loop na proxima
+             if all_done_event.is_set(): break
              
              with stats_lock:
-                 disc = global_stats["discovery_count"]
+                 # Disc agora é irrelevante pois é dinamico
                  proc_d = global_stats["processed_dirs"]
                  proc_f = global_stats["processed_files"]
                  
@@ -362,45 +330,34 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
              thread_line = " | ".join(threads_str_list)
              pending = pending_dirs_queue.qsize()
              
-             print(f"\n[Scan] Disc:{disc} | Proc:{proc_d} Dirs | {proc_f} Files | Pending:{pending}")
+             print(f"\n[Scan] Proc:{proc_d} Dirs | {proc_f} Files | Pending:~{pending}")
              print(f"[Work] {thread_line}\n")
-             
-             if distributor_done.is_set(): break
-
-    # -----------------------------------------------------------------------
-    # Iniciar Threads
-    # -----------------------------------------------------------------------
-    print(f"[Scan] Iniciando Producer-Consumer Scan ({NUM_SCAN_WORKERS} workers)...")
     
-    # 1. Discovery
-    t_disc = threading.Thread(target=discovery_task, name="Discovery", daemon=True)
-    t_disc.start()
+    # -----------------------------------------------------------------------
+    # Iniciar
+    # -----------------------------------------------------------------------
+    print(f"[Scan] Iniciando Self-Feeding Scan ({NUM_SCAN_WORKERS} workers)...")
     
-    # 2. Distributor
+    # Não existe mais Discovery Thread dedicada (workers fazem isso)
+    
     t_dist = threading.Thread(target=distributor_task, name="Distributor", daemon=True)
     t_dist.start()
     
-    # 3. Workers
     t_workers = []
     for i in range(NUM_SCAN_WORKERS):
         t = threading.Thread(target=worker_task, args=(i,), name=f"Worker-{i}")
         t.start()
         t_workers.append(t)
         
-    # 4. Monitor
     t_mon = threading.Thread(target=monitor_task, name="Monitor", daemon=True)
     t_mon.start()
     
-    # Joins
-    t_disc.join()
     t_dist.join()
     for t in t_workers:
         t.join()
     t_mon.join(timeout=1.0)
     
-    # Sort results
     results.sort(key=lambda e: e.path_rel.lower())
-    
     print(f"[Scan] Finalizado. Total: {len(results)} arquivos.")
     return results
 
