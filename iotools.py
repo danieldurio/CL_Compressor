@@ -162,6 +162,9 @@ def scan_directory_parallel(root: Path) -> List[FileEntry]:
     global_task_list = tasks
     task_lock = threading.Lock()
     
+    results: List[FileEntry] = []
+    results_lock = threading.Lock()
+    
     # Stats por Worker para detalhamento
     # worker_stats[id] = {"dirs": 0, "files": 0, "active": False}
     worker_stats = [{"dirs": 0, "files": 0, "active": False} for _ in range(NUM_SCAN_WORKERS)]
