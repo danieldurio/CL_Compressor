@@ -120,6 +120,8 @@ def _get_defaults() -> Dict[str, Any]:
         
         # IO Tools
         'NUM_SCAN_WORKERS': 4,
+        'PRE_SCAN_TARGET_DIRS': 1000,
+        'SCAN_STATUS_INTERVAL': 5,
         
         # Deduplicator
         'NUM_IO_WORKERS': 4,
@@ -212,3 +214,12 @@ def get_hash_batch_size() -> int:
 def get_dedup_gpu_workers() -> int:
     """Retorna DEDUP_GPU_WORKERS - workers paralelos de hash GPU."""
     return int(get('DEDUP_GPU_WORKERS', 2))
+
+def get_pre_scan_target_dirs() -> int:
+    """Retorna PRE_SCAN_TARGET_DIRS - número alvo de diretórios para Pre-Scan BFS."""
+    return int(get('PRE_SCAN_TARGET_DIRS', 1000))
+
+def get_scan_status_interval() -> float:
+    """Retorna SCAN_STATUS_INTERVAL - intervalo de atualização do console durante scan (segundos)."""
+    return float(get('SCAN_STATUS_INTERVAL', 5))
+

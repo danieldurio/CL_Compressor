@@ -57,101 +57,285 @@ try:
     import config_loader
     # Configuração do scanner paralelo (carregada de config.txt)
     NUM_SCAN_WORKERS = config_loader.get_num_scan_workers()
+    PRE_SCAN_TARGET_DIRS = config_loader.get_pre_scan_target_dirs()
+    SCAN_STATUS_INTERVAL = config_loader.get_scan_status_interval()
 except ImportError:
     NUM_SCAN_WORKERS = 4
+    PRE_SCAN_TARGET_DIRS = 1000
+    SCAN_STATUS_INTERVAL = 5.0
+
+
+def prescan_directories(root: Path, target_dirs: int = 1000) -> List[Tuple[Path, bool]]:
+    """
+    Realiza um Pré-Scan BFS por NÍVEIS para descobrir subdiretórios.
+    Logs no formato: [Pre-Scan] Level X = Y Dirs
+    
+    Retorna lista de tarefas (path, recursive).
+    """
+    root = root.resolve()
+    
+    # Lista final de tarefas (path, recursive)
+    final_tasks = []
+    
+    # Fronteira atual (diretórios a expandir)
+    current_frontier = [root]
+    
+    level = 1
+    import time
+    start_time = time.time()
+    
+    while current_frontier:
+        count_frontier = len(current_frontier)
+        count_tasks = len(final_tasks)
+        total_potential = count_tasks + count_frontier
+        
+        # Log do nível atual
+        print(f"[Pre-Scan] Level {level} = {count_frontier} Dirs (Acumulado: {total_potential})")
+        
+        # Verificar se atingimos o alvo (considerando a fronteira atual como tasks finais)
+        if total_potential >= target_dirs:
+            print(f"[Pre-Scan] Alvo atingido ({target_dirs}). Encerrando expansão.")
+            # Adiciona toda a fronteira atual como tasks RECURSIVAS
+            for d in current_frontier:
+                final_tasks.append((d, True))
+            break
+            
+        next_frontier = []
+        
+        for dir_path in current_frontier:
+            # Expandir diretório
+            try:
+                subdirs = []
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            subdirs.append(Path(entry.path))
+                
+                if subdirs:
+                    # Tem filhos:
+                    # 1. Este diretório vira task NÃO-RECURSIVA (só arquivos locais)
+                    final_tasks.append((dir_path, False))
+                    # 2. Filhos vão para a próxima fronteira
+                    next_frontier.extend(subdirs)
+                else:
+                    # Não tem filhos: vira task RECURSIVA (scan normal)
+                    final_tasks.append((dir_path, True))
+            
+            except (PermissionError, OSError):
+                # Erro de acesso: deixa como recursiva para o worker tentar/logar erro
+                final_tasks.append((dir_path, True))
+                
+            # Check rápido intra-nível para não estourar muito o target se o nível for enorme
+            if len(final_tasks) + len(next_frontier) >= target_dirs * 1.5:
+                 # Se já passamos 50% do target no meio do nível, podemos parar de expandir este nível
+                 # O restante da current_frontier vira recursivo
+                 remaining_index = current_frontier.index(dir_path) + 1
+                 remaining = current_frontier[remaining_index:]
+                 for r in remaining:
+                     final_tasks.append((r, True))
+                 # E a próxima fronteira (que já geramos) será processada ou adicionada? 
+                 # Na verdade, se paramos aqui, next_frontier vira recursivo na prox iteração ou break
+                 break
+        
+        current_frontier = next_frontier
+        level += 1
+        
+        if not current_frontier:
+            break
+            
+    print(f"[Pre-Scan] Concluído em {time.time()-start_time:.2f}s. {len(final_tasks)} tarefas geradas.")
+    return final_tasks
 
 
 def scan_directory_parallel(root: Path) -> List[FileEntry]:
     """
-    Scanner paralelo com work-stealing.
-    Usa workers fixos que subdividem diretórios grandes dinamicamente.
+    Scanner paralelo otimizado com Pre-Scan e Workers Atômicos (Batch Processing).
     """
     root = root.resolve()
     
-    # Fila thread-safe de diretórios a processar
-    work_queue: Queue[Path] = Queue()
+    # 1. Pre-Scan para dividir trabalho
+    # Retorna lista de (path, recursive)
+    tasks = prescan_directories(root, target_dirs=PRE_SCAN_TARGET_DIRS)
     
-    # Lock para contagem de workers ativos (para detectar término)
-    active_workers = [0]
-    active_lock = threading.Lock()
-    all_done = threading.Event()
+    # 2. Configurar Lista de Tarefas e Lock (Em vez de Queue, para Batching)
+    # Lista simples é mais flexível para slicing
+    global_task_list = tasks
+    task_lock = threading.Lock()
     
-    results: List[List[FileEntry]] = [[] for _ in range(NUM_SCAN_WORKERS)]
-    
-    stats = {"dirs_processed": 0, "files_found": 0}
+    # Stats por Worker para detalhamento
+    # worker_stats[id] = {"dirs": 0, "files": 0, "active": False}
+    worker_stats = [{"dirs": 0, "files": 0, "active": False} for _ in range(NUM_SCAN_WORKERS)]
     stats_lock = threading.Lock()
     
-    def process_path(path_abs: Path) -> Optional[FileEntry]:
-        try:
-            if not path_abs.is_file():
-                return None
-            size = path_abs.stat().st_size
-            path_rel = str(path_abs.relative_to(root)).replace("\\", "/")
-            return FileEntry(path_abs=path_abs, path_rel=path_rel, size=size)
-        except (PermissionError, FileNotFoundError, OSError):
-            return None
+    all_done_event = threading.Event()
     
-    def worker(worker_id: int):
-        local_entries = results[worker_id]
-        local_dirs_count = 0
-        local_files_count = 0
-        
-        while not all_done.is_set():
-            try:
-                current_dir = work_queue.get(timeout=0.05)
-            except Empty:
-                with active_lock:
-                    if active_workers[0] == 0 and work_queue.empty():
-                        all_done.set()
-                continue
+    # Batch Size Dinâmico ou Fixo?
+    TASK_BATCH_SIZE = 1000
+    
+    # 3. Status Monitor (Thread dedicada)
+    def status_monitor():
+        import time
+        while not all_done_event.is_set():
+            time.sleep(SCAN_STATUS_INTERVAL)
+            if all_done_event.is_set(): break
             
-            with active_lock:
-                active_workers[0] += 1
+            # Coletar snapshot dos stats
+            total_dirs = 0
+            total_files = 0
+            active_threads = 0
             
-            try:
-                with os.scandir(current_dir) as it:
-                    for entry in it:
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                work_queue.put(Path(entry.path))
-                            elif entry.is_file(follow_symlinks=False):
-                                file_entry = process_path(Path(entry.path))
-                                if file_entry:
-                                    local_entries.append(file_entry)
-                                    local_files_count += 1
-                        except (PermissionError, OSError):
-                            pass
-                local_dirs_count += 1
-            except (PermissionError, OSError):
-                pass
-            finally:
-                with active_lock:
-                    active_workers[0] -= 1
-                work_queue.task_done()
+            threads_output = []
+            
+            with stats_lock:
+                for i, w_stat in enumerate(worker_stats):
+                    d = w_stat["dirs"]
+                    f = w_stat["files"]
+                    is_active = w_stat["active"]
+                    
+                    if is_active:
+                        active_threads += 1
+                        
+                    total_dirs += d
+                    total_files += f
+                    
+                    # Formatar output individual compacto: "T0: 10D/50F"
+                    # Se tiver muitos workers, pode poluir. Vamos tentar fazer algo legível.
+                    # Mas o usuário pediu algo explicito como: T1:4379 DIR | T1:12184 Files
+                    # Vamos simplificar para caber na linha: T1: 10D 50F
+                    threads_output.append(f"T{i}:{d}D {f}F")
+
+            with task_lock:
+                remaining = len(global_task_list)
+            
+            # Montar strings
+            # Linha 1: Detalhes
+            # Linha 2: Totais
+            
+            # Quebrar linha de threads se for muito longa?
+            # Vamos juntar tudo com piping
+            threads_str = " | ".join(threads_output)
+            
+            print(f"\n[Scan Threads] {threads_str}")
+            print(f"[Scan Total]   {total_dirs} DIR | {total_files} Files | {active_threads} Active | Pending: {remaining}\n")
+            
+    monitor_thread = threading.Thread(target=status_monitor, name="ScanMonitor", daemon=True)
+    monitor_thread.start()
+    
+    # 4. Worker Atômico (Batch Mode)
+    def scan_worker(worker_id):
+        local_entries = []
+        # Mantemos contadores locais para flush periódico no stlot global do worker
+        w_dirs = 0
+        w_files = 0
         
+        # Marcar como ativo
         with stats_lock:
-            stats["dirs_processed"] += local_dirs_count
-            stats["files_found"] += local_files_count
+            worker_stats[worker_id]["active"] = True
+
+        try:
+            while True:
+                # --- CRITICAL SECTION: Adquirir Lote ---
+                batch = []
+                with task_lock:
+                    if not global_task_list:
+                         break
+                    batch = global_task_list[:TASK_BATCH_SIZE]
+                    del global_task_list[:TASK_BATCH_SIZE]
+                # ---------------------------------------
+                
+                try:
+                    # Processar lote
+                    for (path, recursive) in batch:
+                        if recursive:
+                            for r, d, f in os.walk(path):
+                                w_dirs += 1
+                                r_path = Path(r)
+                                for name in f:
+                                    try:
+                                        full_path = r_path / name
+                                        size = full_path.stat().st_size
+                                        path_rel = str(full_path.relative_to(root)).replace("\\", "/")
+                                        local_entries.append(FileEntry(path_abs=full_path, path_rel=path_rel, size=size))
+                                        w_files += 1
+                                    except OSError: pass
+                                
+                                # Flush periódico
+                                if w_dirs >= 50:
+                                    with stats_lock:
+                                        worker_stats[worker_id]["dirs"] += w_dirs
+                                        worker_stats[worker_id]["files"] += w_files
+                                    w_dirs = 0
+                                    w_files = 0
+                        else:
+                            # Scan raso
+                            w_dirs += 1
+                            try:
+                                with os.scandir(path) as it:
+                                    for entry in it:
+                                        if entry.is_file(follow_symlinks=False):
+                                            try:
+                                                full_path = Path(entry.path)
+                                                stat_res = entry.stat()
+                                                size = stat_res.st_size
+                                                path_rel = str(full_path.relative_to(root)).replace("\\", "/")
+                                                local_entries.append(FileEntry(path_abs=full_path, path_rel=path_rel, size=size))
+                                                w_files += 1
+                                            except OSError: pass
+                            except OSError: pass
+                        
+                        # Flush entre tarefas
+                        if w_dirs >= 10:
+                            with stats_lock:
+                                worker_stats[worker_id]["dirs"] += w_dirs
+                                worker_stats[worker_id]["files"] += w_files
+                            w_dirs = 0
+                            w_files = 0
+                    
+                    # Flush fim do batch
+                    if w_dirs > 0 or w_files > 0:
+                        with stats_lock:
+                            worker_stats[worker_id]["dirs"] += w_dirs
+                            worker_stats[worker_id]["files"] += w_files
+                        w_dirs = 0
+                        w_files = 0
+                        
+                except Exception:
+                    # Se der erro no lote, segue a vida
+                    pass
+        finally:
+            with stats_lock:
+                worker_stats[worker_id]["active"] = False
+                # Final flush se sobrou algo
+                if w_dirs > 0 or w_files > 0:
+                     worker_stats[worker_id]["dirs"] += w_dirs
+                     worker_stats[worker_id]["files"] += w_files
+            
+        if local_entries:
+            with results_lock:
+                results.extend(local_entries)
     
-    work_queue.put(root)
+    # Iniciar Workers
+    workers = []
+    print(f"[Scan] Iniciando {NUM_SCAN_WORKERS} workers para processar {len(tasks)} tarefas (Batch Size: {TASK_BATCH_SIZE})...")
     
-    threads = []
     for i in range(NUM_SCAN_WORKERS):
-        t = threading.Thread(target=worker, args=(i,), name=f"ScanWorker-{i}", daemon=True)
+        t = threading.Thread(target=scan_worker, args=(i,), name=f"ScanWorker-{i}")
         t.start()
-        threads.append(t)
-    
-    for t in threads:
+        workers.append(t)
+        
+    # Aguardar
+    for t in workers:
         t.join()
+        
+    # Parar monitor
+    all_done_event.set()
+    monitor_thread.join(timeout=1.0)
     
-    all_entries: List[FileEntry] = []
-    for worker_entries in results:
-        all_entries.extend(worker_entries)
+    # Sort final
+    results.sort(key=lambda e: e.path_rel.lower())
     
-    all_entries.sort(key=lambda e: e.path_rel.lower())
-    
-    print(f"[SCAN] [OK] {len(all_entries)} arquivos encontrados | {stats['dirs_processed']} dirs | {NUM_SCAN_WORKERS} workers")
-    return all_entries
+    print(f"[Scan] Concluído. Total: {len(results)} arquivos encontrados. {stats['dirs_scanned']} diretórios verificados.")
+    return results
 
 
 def scan_directory(root: Path, parallel: bool = True) -> List[FileEntry]:
@@ -384,9 +568,11 @@ def generate_frames(entries: Iterable[FileEntry], frame_size: int) -> Iterator[t
                         del small_files_buffer[:frame_size]
                         frame_id += 1
                         
-                        remaining = file_size - len(chunk)
                         if remaining <= 0:
                             continue
+                    else:
+                        # Buffer ainda não cheio: adicionar este arquivo à lista de pendentes
+                        buffer_entries.append(entry)
                 
                 # Fase 2: Processar restante
                 while True:

@@ -28,21 +28,21 @@ FORCE_CPU_MODE = False
 #     VRAM 8-12 GB → 32-64 frames
 #     VRAM 12+ GB  → 64-128 frames
 #   Valores muito altos podem causar erros de memória GPU!
-COMPRESSOR_BATCH_SIZE = 72
+COMPRESSOR_BATCH_SIZE = 85
 
 # READ_BUFFER_BATCHES - Número de batches em buffer para leitura antecipada (read-ahead)
 #   Maior valor = Mais RAM usada, menos espera por I/O de leitura
 #   0 = INFINITO (CUIDADO! Alto consumo de RAM)
 #   1 = Mínimo (1 batch por vez, menor uso de RAM)
 #   Recomendado: 1-2 para sistemas com pouca RAM, 2-4 para RAM abundante
-READ_BUFFER_BATCHES = 1
+READ_BUFFER_BATCHES = 2
 
 # WRITE_BUFFER_BATCHES - Número de batches em buffer para escrita atrasada (write-behind)
 #   Maior valor = Mais RAM usada, menos espera por I/O de escrita
 #   0 = INFINITO (CUIDADO! Alto consumo de RAM)
 #   1 = Mínimo (1 batch por vez, menor uso de RAM)
 #   Recomendado: 1-2 para HDDs lentos, 1 para SSDs rápidos
-WRITE_BUFFER_BATCHES = 1
+WRITE_BUFFER_BATCHES = 2
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
@@ -74,8 +74,20 @@ GPU_FALLBACK_ENABLED = True
 #   Mais workers = Scan mais rápido em HDDs grandes e diretórios complexos
 #   Menos workers = Menor uso de CPU durante scan
 #   Recomendado: 2-4 para HDDs, 4-8 para SSDs/NVMe
-NUM_SCAN_WORKERS = 4
+NUM_SCAN_WORKERS = 16
 
+# PRE_SCAN_TARGET_DIRS - Número alvo de diretórios para Pre-Scan por níveis
+#   O Pre-Scan expande nível por nível (BFS) até atingir este número
+#   Depois distribui os diretórios entre workers atômicos
+#   Maior valor = Mais diretórios descobertos antes de paralelizar
+#   Recomendado: 500-2000 (ajustar conforme estrutura típica de pastas)
+PRE_SCAN_TARGET_DIRS = 3000
+
+# SCAN_STATUS_INTERVAL - Intervalo de atualização do console durante scan (segundos)
+#   Define frequência de logs [Scan] X DIR | Y Files | Z Threads
+#   Menor valor = Mais verbose, Maior valor = Menos spam no console
+#   Recomendado: 3-10 segundos
+SCAN_STATUS_INTERVAL = 5
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                         DEDUPLICATOR                                           ║
@@ -85,14 +97,14 @@ NUM_SCAN_WORKERS = 4
 #   Mais workers = Leitura paralela mais rápida durante filtros byte-a-byte
 #   Menos workers = Menor stress no disco
 #   Recomendado: 4 para HDDs, 8-16 para SSDs
-NUM_IO_WORKERS = 4
+NUM_IO_WORKERS = 16
 
 # NUM_READERS - Número de threads de leitura para hash GPU (Stage 5)
 #   Multi-Reader: Threads leem arquivos em paralelo para alimentar GPU
 #   Mais readers = GPU sempre ocupada (melhor throughput)
 #   Menos readers = Menor consumo de RAM para buffers
 #   Recomendado: 4-8 para a maioria dos sistemas
-NUM_READERS = 4
+NUM_READERS = 16
 
 # BUFFER_SIZE - Tamanho do buffer da fila entre readers e GPU (Stage 5)
 #   Maior buffer = GPU nunca fica ociosa esperando dados
@@ -120,7 +132,7 @@ HASH_LOG = 20
 #   Menor = Processamento mais rápido, menos memória
 #   Valor padrão: 7 (bom equilíbrio velocidade/ratio)
 #   Range típico: 4-12
-HASH_CANDIDATES = 17
+HASH_CANDIDATES = 12
 
 # GOOD_ENOUGH_MATCH - Comprimento de match considerado "bom o suficiente"
 #   Quando um match atinge este tamanho, para de procurar matches melhores
